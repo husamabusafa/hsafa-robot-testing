@@ -109,6 +109,9 @@ class GeminiLiveSession:
         speaker_sink: Optional[SpeakerSink] = None,
         mic_poll_interval: float = 0.02,  # 20 ms -> ~320 samples @ 16 kHz
         mic_gate_tail_s: float = 0.6,
+        barge_in_rms: float = 0.03,
+        barge_in_min_chunks: int = 3,
+        barge_in_hold_s: float = 2.0,
     ) -> None:
         if not api_key:
             raise ValueError("GeminiLiveSession requires a GEMINI_API_KEY")
@@ -128,11 +131,38 @@ class GeminiLiveSession:
         self._speaker_sink = speaker_sink
         self._mic_poll_interval = mic_poll_interval
         self._mic_gate_tail_s = mic_gate_tail_s
+        # Barge-in threshold, measured as linear RMS (sqrt(mean(arr**2)))
+        # of the downmixed float32 mono chunk.
+        #
+        # Why RMS and not peak: when Reachy's speaker plays Gemini's voice,
+        # the mic picks up the bleed. Measured on this hardware the bleed
+        # peak sits at roughly -25 dBFS (0.05 linear) but its RMS is around
+        # -50 dBFS (0.003 linear). Human speech at normal volume has RMS
+        # ~-25 to -30 dBFS (0.03-0.06). RMS therefore discriminates voice
+        # from bleed by ~20 dB, while peak would false-trigger on the
+        # first speaker transient and permanently arm the barge-in window,
+        # which is exactly what was stopping Gemini from firing
+        # ``server_content.interrupted``.
+        self._barge_in_rms = float(barge_in_rms)
+        # Require this many CONSECUTIVE chunks above the RMS threshold
+        # before arming the barge-in hold. Rejects brief transients that
+        # would otherwise keep poisoning the stream sent to Gemini's VAD.
+        self._barge_in_min_chunks = max(1, int(barge_in_min_chunks))
+        # Once sustained loud audio trips the threshold, keep the gate
+        # OPEN for this many seconds so Gemini's server-side VAD receives
+        # a continuous audio stream (it won't fire ``interrupted`` on
+        # sparse loud bursts separated by gated silence).
+        self._barge_in_hold_s = float(barge_in_hold_s)
         # Monotonic timestamp. Mic frames captured before this time are
         # dropped (not sent to Gemini) to avoid feeding the robot's own
         # speaker output back into Gemini's VAD, which would keep any
         # turn perpetually "open" and stall the conversation.
         self._mic_gate_until: float = 0.0
+        # Monotonic timestamp. While now < _barge_in_until, ALL mic
+        # frames are sent regardless of ``is_speaking``/``mic_gate_until``.
+        self._barge_in_until: float = 0.0
+        # Counter of consecutive loud chunks (resets on any quiet chunk).
+        self._barge_in_run: int = 0
  
         # Cross-thread state
         self.is_speaking = threading.Event()
@@ -257,6 +287,12 @@ class GeminiLiveSession:
                     prefix_padding_ms=20,
                     silence_duration_ms=250,
                 ),
+                # Without this, some preview models default to
+                # ``NO_INTERRUPTION`` and keep talking even after the
+                # user's voice has been detected during the model's turn.
+                activity_handling=(
+                    types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS
+                ),
             ),
             session_resumption=types.SessionResumptionConfig(
                 handle=self._resumption_handle,
@@ -290,7 +326,8 @@ class GeminiLiveSession:
         stats = {
             "sent": 0, "send_fail": 0,
             "peak": 0, "rms_sum_sq": 0.0, "blocks": 0,
-            "empty_polls": 0, "gated": 0,
+            "empty_polls": 0, "gated": 0, "barge_in": 0,
+            "gated_rms": 0.0,  # max linear RMS among GATED chunks
         }
  
         async def diag_loop():
@@ -310,15 +347,23 @@ class GeminiLiveSession:
                 empty = stats["empty_polls"]; stats["empty_polls"] = 0
                 send_fail = stats["send_fail"]; stats["send_fail"] = 0
                 gated = stats["gated"]; stats["gated"] = 0
+                barge_in = stats["barge_in"]; stats["barge_in"] = 0
+                grm_lin = stats["gated_rms"]; stats["gated_rms"] = 0.0
+                gated_rms_i16 = int(grm_lin * 32768.0)
                 rms = math.sqrt(rms_sum_sq / blocks) if blocks else 0.0
                 # Typical speaking voice 30 cm from the mic: peak -6..-20
                 # dBFS, RMS -25..-40 dBFS. Peak < -45 dBFS => Gemini will
                 # likely miss you; peak at 0 dBFS => clipping.
+                # ``gated_rms`` shows the loudest RMS among GATED chunks
+                # (i.e. speaker bleed). Set ``barge_in_rms`` 6-10 dB above
+                # this so real speech trips barge-in but bleed doesn't.
                 log.info(
                     "MIC  sent=%d/%.1fs peak=%+.1fdBFS rms=%+.1fdBFS "
-                    "blocks=%d empty=%d gated=%d send_fail=%d",
+                    "blocks=%d empty=%d gated=%d (rms=%+.1fdBFS) "
+                    "barge_in=%d send_fail=%d",
                     sent, dt, _dbfs(peak), _dbfs(rms),
-                    blocks, empty, gated, send_fail,
+                    blocks, empty, gated, _dbfs(gated_rms_i16),
+                    barge_in, send_fail,
                 )
  
         diag_task = asyncio.create_task(diag_loop(), name="mic-diag")
@@ -335,16 +380,6 @@ class GeminiLiveSession:
                     await asyncio.sleep(self._mic_poll_interval)
                     continue
  
-                # Echo-gate: drop mic frames while Gemini is talking, plus
-                # a short tail to let the speaker buffer and room echo
-                # decay. Without this, the open mic feeds Gemini's VAD
-                # the robot's own voice and turn_complete is never fired
-                # -> conversation stalls after the first reply.
-                if self.is_speaking.is_set() or time.monotonic() < self._mic_gate_until:
-                    stats["gated"] += 1
-                    await asyncio.sleep(self._mic_poll_interval)
-                    continue
- 
                 # Downmix and convert: accept (N,), (N, C), or (C, N).
                 arr = np.asarray(sample, dtype=np.float32)
                 if arr.ndim == 2:
@@ -354,6 +389,45 @@ class GeminiLiveSession:
                         arr = arr.T
                     arr = arr.mean(axis=1)
                 np.clip(arr, -1.0, 1.0, out=arr)
+
+                # Echo-gate: drop mic frames while Gemini is talking, plus
+                # a short tail to let the speaker buffer and room echo
+                # decay. Without this, the open mic feeds Gemini's VAD
+                # the robot's own voice and turn_complete is never fired
+                # -> conversation stalls after the first reply.
+                # Exception: if the chunk's RMS is sustained above the
+                # speaker-bleed level for multiple consecutive chunks,
+                # it's the user talking over Gemini. We open a short
+                # "barge-in hold" window during which ALL mic frames are
+                # sent so Gemini's server VAD sees a continuous audio
+                # stream and fires ``interrupted`` (sparse loud bursts
+                # alone are not enough, and peak-based detection
+                # false-triggers on speaker transients).
+                now = time.monotonic()
+                if arr.size:
+                    chunk_rms = float(np.sqrt(np.mean(arr * arr)))
+                else:
+                    chunk_rms = 0.0
+                if chunk_rms >= self._barge_in_rms:
+                    self._barge_in_run += 1
+                    if self._barge_in_run >= self._barge_in_min_chunks:
+                        self._barge_in_until = now + self._barge_in_hold_s
+                else:
+                    self._barge_in_run = 0
+                barge_in_active = now < self._barge_in_until
+                gating = (
+                    self.is_speaking.is_set()
+                    or now < self._mic_gate_until
+                )
+                if gating and not barge_in_active:
+                    stats["gated"] += 1
+                    if chunk_rms > stats["gated_rms"]:
+                        stats["gated_rms"] = chunk_rms
+                    await asyncio.sleep(self._mic_poll_interval)
+                    continue
+                if barge_in_active and gating:
+                    stats["barge_in"] += 1
+
                 pcm16 = (arr * 32767.0).astype(np.int16)
  
                 if pcm16.size:
