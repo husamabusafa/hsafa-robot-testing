@@ -25,10 +25,11 @@ Limitations (honest):
 
 * Requires the speaker to be visible. Off-camera voices cannot be
   attributed (voice enrollment, when added later, will cover this).
-* Static-pose false positives (chewing, smiling) are possible. Gating
-  on "the mic is currently hearing speech" would reduce these; left as
-  a follow-up because the current Gemini session doesn't expose a
-  per-chunk speech flag to the tracker.
+* Static-pose false positives (chewing, smiling) used to leak through.
+  When an ``audio_active_fn`` is wired in (e.g. Silero VAD -- see
+  ``audio_vad.py``) ``is_speaking`` gates on lips-AND-audio so chewing
+  alone no longer lights up. This is the "fusion rule" from
+  ``docs/tech-recommendations.md`` §1.1.
 * MTCNN misses heavily-occluded / very small / back-of-head faces.
 """
 from __future__ import annotations
@@ -50,6 +51,10 @@ log = logging.getLogger(__name__)
 
 Bbox = Tuple[int, int, int, int]  # (x1, y1, x2, y2), pixel coords
 FrameGetter = Callable[[], Optional[np.ndarray]]
+# Callable returning True iff the mic is currently hearing speech
+# (i.e. Silero VAD says audio_speech_active). Optional -- when None
+# is_speaking is driven by lip motion alone.
+AudioActiveFn = Callable[[], bool]
 
 
 # ---- Tunables -------------------------------------------------------------
@@ -217,6 +222,7 @@ class LipMotionTracker(threading.Thread):
         *,
         poll_hz: float = DEFAULT_POLL_HZ,
         identify_period_s: float = DEFAULT_IDENTIFY_PERIOD_S,
+        audio_active_fn: Optional[AudioActiveFn] = None,
         name: str = "lip-motion",
     ) -> None:
         super().__init__(daemon=True, name=name)
@@ -224,6 +230,7 @@ class LipMotionTracker(threading.Thread):
         self._get_frame = get_frame
         self._period = 1.0 / max(poll_hz, 0.5)
         self._identify_period_s = identify_period_s
+        self._audio_active_fn = audio_active_fn
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
         self._tracks: Dict[int, _Track] = {}
@@ -231,6 +238,10 @@ class LipMotionTracker(threading.Thread):
         self._last_identify_ts = 0.0
         self._frame_w = 0
         self._frame_h = 0
+        # Keep a tail of recent audio-active history so transient
+        # audio drops don't immediately flip is_speaking off while
+        # a person is actually mid-syllable.
+        self._audio_tail_until = 0.0
 
     # ---- lifecycle -----------------------------------------------------
     def stop(self) -> None:
@@ -367,12 +378,34 @@ class LipMotionTracker(threading.Thread):
             track.last_patch = patch
 
     # ---- read-only snapshot -------------------------------------------
+    def _audio_gate(self, now: float) -> bool:
+        """Return True iff audio is currently (or very recently) active.
+
+        No-op when no ``audio_active_fn`` was supplied -- the tracker
+        degrades to lip-motion only in that case.
+        """
+        if self._audio_active_fn is None:
+            return True
+        try:
+            active = bool(self._audio_active_fn())
+        except Exception:
+            return True   # fail-open: don't hide real speakers on errors
+        if active:
+            # Keep the gate open for 300 ms after audio drops so a
+            # millisecond-long silence between syllables doesn't flip
+            # is_speaking off on real speech.
+            self._audio_tail_until = now + 0.3
+            return True
+        return now < self._audio_tail_until
+
     def snapshot(self) -> List[SpeakerCandidate]:
         with self._lock:
             now = time.time()
+            audio_ok = self._audio_gate(now)
             out: List[SpeakerCandidate] = []
             for track in self._tracks.values():
                 peak = track.peak_motion(now)
+                lip_moving = peak >= SPEAKING_MOTION_THRESHOLD
                 out.append(
                     SpeakerCandidate(
                         track_id=track.track_id,
@@ -380,7 +413,7 @@ class LipMotionTracker(threading.Thread):
                         position=_bbox_position(track.bbox, track.frame_w),
                         bbox=track.bbox,
                         motion_score=peak,
-                        is_speaking=peak >= SPEAKING_MOTION_THRESHOLD,
+                        is_speaking=lip_moving and audio_ok,
                         last_seen_age_s=now - track.last_seen_ts,
                         frame_w=track.frame_w,
                         frame_h=track.frame_h,

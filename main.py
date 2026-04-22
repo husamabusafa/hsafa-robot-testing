@@ -57,10 +57,20 @@ from dotenv import load_dotenv
 from google.genai import types as genai_types
 from reachy_mini import ReachyMini
 
+from hsafa_robot.audio_vad import SileroVAD
+from hsafa_robot.events import (
+    EVT_PERSON_LEFT,
+    EVT_VOICE_UNSEEN,
+    EventBus,
+)
 from hsafa_robot.face_db import FaceDB, canonicalize_name
 from hsafa_robot.face_recognizer import FaceRecognizer
 from hsafa_robot.focus import FocusManager, FocusSnapshot
+from hsafa_robot.gaze_policy import GazePrior
 from hsafa_robot.gemini_live import GeminiLiveSession
+from hsafa_robot.gestures import GestureTracker
+from hsafa_robot.head_pose import HeadPoseTracker
+from hsafa_robot.identity_graph import IdentityGraph
 from hsafa_robot.lip_motion import LipMotionTracker
 from hsafa_robot.robot_control import RobotController, head_pose
 from hsafa_robot.tracker import (
@@ -71,6 +81,7 @@ from hsafa_robot.tracker import (
     ensure_pose_model,
     pick_device,
 )
+from hsafa_robot.world_state import WorldStateHolder
 
 log = logging.getLogger("hsafa_robot.main")
 
@@ -108,10 +119,6 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "Only people visible to the camera can be detected this way; an "
     "off-camera voice will come back as 'nobody'."
     "\n\n"
-    "If a known face is saved under the wrong name (e.g. the user "
-    "says 'actually I'm Husam, not Kindom'), call `rename_person` with "
-    "the old and new names and confirm. "
-    "\n\n"
     "You can also control who the robot physically looks at:\n"
     "- `focus_on_person(name)` locks the head and body onto that "
     "known person, even if they move across the frame. Use it when "
@@ -123,16 +130,33 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "- `clear_focus()` returns to the default behavior (follow the "
     "closest person). Use it for 'look around normally', 'stop "
     "following him', 'relax'.\n"
+    "- `set_gaze_mode(mode, name?)` is the lower-level version: "
+    "`mode=\"person\"` locks to `name`, `mode=\"normal\"` uses the "
+    "scoring engine (default), `mode=\"speaker\"` biases it toward "
+    "the current speaker.\n"
     "When a focus call succeeds briefly describe what you are doing "
     "(\"okay, watching you\" / \"following the speaker\"); if it fails "
     "because the person is not visible, say so and suggest stepping "
     "into view."
+    "\n\n"
+    "You can also sense hand gestures (wave, point, thumbs_up, "
+    "open_palm, fist). When you notice a gesture mentioned in the "
+    "scene, react to it naturally (\"hey, hi!\" on a wave, "
+    "\"looking at what you're pointing at\" on a point). You can call "
+    "`detect_gestures()` to explicitly ask what gestures are "
+    "currently visible if the user asks."
+    "\n\n"
+    "For any quick \"what's happening right now\" question (who's "
+    "here, who's addressing you, what gestures are up, what gaze "
+    "mode you're in) you can call `describe_scene()` -- it returns "
+    "a compact one-line summary of the live WorldState."
 )
 
 
-# --- Face recognition tools ------------------------------------------------
+# --- Data directories ------------------------------------------------------
 
 FACE_DB_DIR = Path(__file__).resolve().parent / "data" / "faces"
+IDENTITY_DIR = Path(__file__).resolve().parent / "data" / "identity"
 
 
 def build_face_tools() -> list:
@@ -228,29 +252,6 @@ def build_face_tools() -> list:
                     ),
                 ),
                 genai_types.FunctionDeclaration(
-                    name="rename_person",
-                    description=(
-                        "Fix a wrong stored name. Moves every saved "
-                        "embedding from `old_name` to `new_name`; if "
-                        "`new_name` already exists the embeddings are "
-                        "merged (they're probably the same person)."
-                    ),
-                    parameters=genai_types.Schema(
-                        type=genai_types.Type.OBJECT,
-                        properties={
-                            "old_name": genai_types.Schema(
-                                type=genai_types.Type.STRING,
-                                description="Current stored name.",
-                            ),
-                            "new_name": genai_types.Schema(
-                                type=genai_types.Type.STRING,
-                                description="The correct name to save under.",
-                            ),
-                        },
-                        required=["old_name", "new_name"],
-                    ),
-                ),
-                genai_types.FunctionDeclaration(
                     name="focus_on_person",
                     description=(
                         "Lock the robot's head (and body) onto a named "
@@ -296,6 +297,68 @@ def build_face_tools() -> list:
                         properties={},
                     ),
                 ),
+                genai_types.FunctionDeclaration(
+                    name="set_gaze_mode",
+                    description=(
+                        "Directly set the robot's gaze mode. "
+                        "`mode=\"person\"` with a `name` locks onto "
+                        "that person (silently falls back to normal "
+                        "scoring if they leave frame). "
+                        "`mode=\"normal\"` runs the default scoring "
+                        "engine. `mode=\"speaker\"` is syntactic "
+                        "sugar for normal + a speaker-bias prior."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={
+                            "mode": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description=(
+                                    "One of 'normal', 'person', "
+                                    "'speaker'."
+                                ),
+                            ),
+                            "name": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description=(
+                                    "Required when mode='person'."
+                                ),
+                            ),
+                        },
+                        required=["mode"],
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="describe_scene",
+                    description=(
+                        "Return a compact summary of the current "
+                        "world state: everyone visible, their "
+                        "direction, whether they are speaking, "
+                        "whether they are facing the camera, any "
+                        "active gestures, and what the robot is "
+                        "currently focused on. Call this when the "
+                        "user asks 'what do you see?', 'who's here?', "
+                        "'what's going on?', or any similar "
+                        "situational question."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="detect_gestures",
+                    description=(
+                        "Return the list of hand gestures currently "
+                        "visible, attributed to each person. "
+                        "Gestures include wave, point, thumbs_up, "
+                        "open_palm, fist."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
             ],
         ),
     ]
@@ -307,6 +370,8 @@ def make_tool_handler(
     lip_tracker: Optional[LipMotionTracker] = None,
     focus_manager: Optional[FocusManager] = None,
     cascade_tracker: Optional[CascadeTracker] = None,
+    world: Optional[WorldStateHolder] = None,
+    identity_graph: Optional[IdentityGraph] = None,
 ):
     """Build the async tool handler closure Gemini Live will call."""
 
@@ -326,6 +391,13 @@ def make_tool_handler(
                     "name": person,
                     "reason": "no_face_visible",
                 }
+            # Mirror into the identity graph so voice enrollment
+            # can link to the same person later.
+            if identity_graph is not None:
+                try:
+                    identity_graph.record_face_enrollment(person, count)
+                except Exception as e:  # pragma: no cover
+                    log.warning("identity_graph enrollment hook failed: %s", e)
             return {"ok": True, "name": person, "samples_captured": count}
 
         if name == "identify_person":
@@ -394,29 +466,6 @@ def make_tool_handler(
                 "faces": [c.to_dict() for c in snap],
             }
 
-        if name == "rename_person":
-            old = str(args.get("old_name", "")).strip()
-            new = str(args.get("new_name", "")).strip()
-            if not old or not new:
-                return {
-                    "ok": False,
-                    "error": "old_name and new_name are both required",
-                }
-            success = recognizer.db.rename(old, new)
-            if not success:
-                known = recognizer.db.list_names()
-                return {
-                    "ok": False,
-                    "reason": "not_found",
-                    "old_name": old,
-                    "known_names": known,
-                }
-            return {
-                "ok": True,
-                "old_name": canonicalize_name(old),
-                "new_name": canonicalize_name(new),
-            }
-
         if name == "focus_on_person":
             if focus_manager is None or cascade_tracker is None:
                 return {"ok": False, "error": "focus subsystem disabled"}
@@ -466,6 +515,83 @@ def make_tool_handler(
                 return {"ok": False, "error": "focus subsystem disabled"}
             focus_manager.set_mode_auto()
             return {"ok": True, "mode": "auto"}
+
+        if name == "set_gaze_mode":
+            if focus_manager is None:
+                return {"ok": False, "error": "focus subsystem disabled"}
+            mode = str(args.get("mode", "")).strip().lower()
+            if mode in ("normal", "auto"):
+                focus_manager.set_mode_normal()
+                return {"ok": True, "mode": "normal"}
+            if mode == "speaker":
+                focus_manager.set_mode_speaker()
+                return {"ok": True, "mode": "speaker"}
+            if mode == "person":
+                target = str(args.get("name", "")).strip()
+                if not target:
+                    return {
+                        "ok": False,
+                        "error": "name is required when mode='person'",
+                    }
+                canonical = canonicalize_name(target)
+                if canonical not in recognizer.db.list_names():
+                    return {
+                        "ok": False,
+                        "reason": "unknown_name",
+                        "name": target,
+                        "known_names": recognizer.db.list_names(),
+                    }
+                focus_manager.set_mode_person(canonical)
+                return {
+                    "ok": True,
+                    "mode": "person",
+                    "name": canonical,
+                }
+            return {
+                "ok": False,
+                "error": (
+                    f"unknown mode {mode!r}; expected "
+                    f"'normal' / 'person' / 'speaker'"
+                ),
+            }
+
+        if name == "describe_scene":
+            if world is None:
+                return {"ok": False, "error": "world-state disabled"}
+            snap = world.snapshot()
+            return {
+                "ok": True,
+                "brief": snap.brief_text(),
+                "humans": [h.to_dict() for h in snap.humans],
+                "robot": {
+                    "gaze_mode": snap.robot.gaze_mode,
+                    "gaze_state": snap.robot.gaze_state,
+                    "current_target_name": snap.robot.current_target_name,
+                    "current_target_track_id": snap.robot.current_target_track_id,
+                },
+                "env": {
+                    "audio_speech_active": snap.env.audio_speech_active,
+                },
+            }
+
+        if name == "detect_gestures":
+            if world is None:
+                return {"ok": False, "error": "world-state disabled"}
+            snap = world.snapshot()
+            seen = []
+            for h in snap.humans:
+                if not h.active_gestures:
+                    continue
+                seen.append({
+                    "name": h.name or "unknown",
+                    "position": h.direction,
+                    "gestures": list(h.active_gestures),
+                })
+            return {
+                "ok": True,
+                "count": len(seen),
+                "people": seen,
+            }
 
         return {"ok": False, "error": f"unknown tool: {name}"}
 
@@ -710,6 +836,19 @@ def main() -> None:
                         help="Disable the lip-motion speaker-detection "
                              "tracker (also disables the who_is_speaking "
                              "tool). Implied when face recognition is off.")
+    parser.add_argument("--no-vad", action="store_true",
+                        help="Disable Silero VAD audio-speech gating of "
+                             "lip-motion. Without VAD, chewing/yawning can "
+                             "false-fire the speaker detector.")
+    parser.add_argument("--no-head-pose", action="store_true",
+                        help="Disable MediaPipe head-pose tracker "
+                             "(kills the `is_being_addressed` score term).")
+    parser.add_argument("--no-gestures", action="store_true",
+                        help="Disable MediaPipe Hands gesture recognition "
+                             "(no wave / point / thumbs-up events).")
+    parser.add_argument("--no-identity-graph", action="store_true",
+                        help="Disable the IdentityGraph layer on top of "
+                             "FaceDB (voice enrollment + corrections).")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -726,9 +865,17 @@ def main() -> None:
     load_dotenv()
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 
+    # --- Shared spine: EventBus + WorldStateHolder ---------------------
+    # Every sense writes to `world`; every brain reads it. `bus` is the
+    # fire-and-forget pub/sub for transitions (person_detected, etc.).
+    # See docs/architecture.md.
+    bus = EventBus()
+    world = WorldStateHolder()
+
     # --- Face recognition (optional) -----------------------------------
     face_recognizer: Optional[FaceRecognizer] = None
     face_tools: Optional[list] = None
+    face_db: Optional[FaceDB] = None
     if not args.no_face_recognition:
         face_db = FaceDB(FACE_DB_DIR)
         # Stay on CPU: the models are small and face tools run on demand
@@ -740,6 +887,13 @@ def main() -> None:
             "Face recognition enabled. Known people: %s",
             face_db.list_names() or "(none yet)",
         )
+
+    # --- Identity graph (optional) -------------------------------------
+    identity_graph: Optional[IdentityGraph] = None
+    if face_db is not None and not args.no_identity_graph:
+        identity_graph = IdentityGraph(IDENTITY_DIR, face_db)
+        log.info("IdentityGraph enabled (%d identities).",
+                 len(identity_graph.list_identities()))
 
     # Lip-motion tracker depends on the face recognizer (shares MTCNN +
     # FaceDB). If face recognition is off, lip motion can't run either.
@@ -761,6 +915,12 @@ def main() -> None:
     latest = LatestFrame()
     gemini: Optional[GeminiLiveSession] = None
     cap: Optional[cv2.VideoCapture] = None
+
+    # Optional humanoid senses -- built later, after the camera is open
+    # so they can pull frames from ``latest``.
+    audio_vad: Optional[SileroVAD] = None
+    head_pose_tracker: Optional[HeadPoseTracker] = None
+    gesture_tracker: Optional[GestureTracker] = None
 
     # --- Camera (direct OpenCV, coexists with daemon on macOS) ---------
     cap = open_camera(args.camera)
@@ -791,14 +951,29 @@ def main() -> None:
     tracker.warmup(frame_h, frame_w)
     tracker.start()
 
+    # --- Silero VAD (audio speech detector) ----------------------------
+    # Built before the lip-motion tracker so we can hand it the
+    # ``is_active`` callback. If torch / silero isn't installed the
+    # VAD stays disabled and lip-motion falls back to un-gated.
+    if not args.no_vad:
+        audio_vad = SileroVAD(bus=bus, world=world)
+        audio_vad.start()
+
     # --- Lip-motion speaker tracker ------------------------------------
     if face_recognizer is not None and not args.no_lip_motion:
+        audio_active_fn = None
+        if audio_vad is not None:
+            audio_active_fn = lambda: audio_vad.is_active  # noqa: E731
         lip_tracker = LipMotionTracker(
             recognizer=face_recognizer,
             get_frame=latest.get_frame,
+            audio_active_fn=audio_active_fn,
         )
         lip_tracker.start()
-        log.info("Lip-motion speaker tracker enabled.")
+        log.info(
+            "Lip-motion speaker tracker enabled (audio-VAD gating=%s).",
+            "on" if audio_active_fn is not None else "off",
+        )
 
     # --- Focus manager --------------------------------------------------
     focus_manager: Optional[FocusManager] = None
@@ -807,8 +982,48 @@ def main() -> None:
         focus_manager = FocusManager(
             tracker=tracker,
             lip_tracker=lip_tracker,
+            world=world,
+            bus=bus,
+            frame_w=frame_w,
+            frame_h=frame_h,
         )
-        log.info("FocusManager enabled (modes: auto / person / speaker).")
+        log.info("FocusManager enabled (GazePolicy: normal / person, priors).")
+
+    # --- MediaPipe head-pose tracker -----------------------------------
+    # Stamps each HumanView with yaw/pitch/roll + is_facing_camera so
+    # the GazePolicy can score `is_being_addressed` (see docs/tech-
+    # recommendations.md §1.5).
+    if focus_manager is not None and not args.no_head_pose:
+        head_pose_tracker = HeadPoseTracker(
+            get_frame=latest.get_frame,
+            yolo_tracks=tracker.get_all_tracks,
+            registry=focus_manager.registry,
+        )
+        head_pose_tracker.start()
+
+    # --- MediaPipe gesture tracker -------------------------------------
+    if focus_manager is not None and not args.no_gestures:
+        gesture_tracker = GestureTracker(
+            get_frame=latest.get_frame,
+            yolo_tracks=tracker.get_all_tracks,
+            registry=focus_manager.registry,
+            bus=bus,
+        )
+        gesture_tracker.start()
+
+    # --- Reactive wiring: person_lost -> directed head search ---------
+    # The gaze-motion planner (natural_gaze.py) handles the visual
+    # "where did they go?" sweep when it gets a notify_person_lost()
+    # call. The controller is built below and picks up this hook.
+    _last_known_yaw = {"value": 0.0}
+
+    def _on_person_left(evt):
+        # Resolve the yaw we were pointing at when they disappeared so
+        # the search sweep starts from there. This runs on the publish
+        # thread so keep it light.
+        _last_known_yaw["value"] = _last_known_yaw.get("value", 0.0)
+
+    bus.subscribe(EVT_PERSON_LEFT, _on_person_left)
 
     # --- Reachy & control loop -----------------------------------------
     log.info("Opening Reachy ... (Ctrl-C or q to quit)")
@@ -838,6 +1053,26 @@ def main() -> None:
                 )
                 args.no_gemini = True
 
+            # --- Mic source that also feeds Silero VAD -----------------
+            # Gemini Live polls mic_source; we intercept each chunk and
+            # push a copy into the VAD so `audio_speech_active` stays
+            # live without a second capture path.
+            def _mic_source_tee():
+                sample = media.get_audio_sample()
+                if sample is None:
+                    return sample
+                if audio_vad is not None and audio_vad.enabled:
+                    try:
+                        arr = np.asarray(sample, dtype=np.float32)
+                        if arr.ndim == 2:
+                            if arr.shape[0] < arr.shape[1]:
+                                arr = arr.T
+                            arr = arr.mean(axis=1)
+                        audio_vad.push_samples(arr)
+                    except Exception as e:   # pragma: no cover
+                        log.debug("VAD push_samples failed: %s", e)
+                return sample
+
             # --- Gemini Live ------------------------------------------------
             if not args.no_gemini:
                 if not api_key:
@@ -851,7 +1086,7 @@ def main() -> None:
                         system_instruction=DEFAULT_SYSTEM_INSTRUCTION,
                         frame_source=latest.get_jpeg,
                         video_fps=args.video_fps,
-                        mic_source=media.get_audio_sample,
+                        mic_source=_mic_source_tee,
                         speaker_sink=media.push_audio_sample,
                     )
                     if face_recognizer is not None and face_tools is not None:
@@ -859,6 +1094,8 @@ def main() -> None:
                         kwargs["tool_handler"] = make_tool_handler(
                             face_recognizer, latest, lip_tracker,
                             focus_manager, tracker,
+                            world=world,
+                            identity_graph=identity_graph,
                         )
                     model = args.model or os.environ.get("GEMINI_MODEL")
                     if model:
@@ -875,6 +1112,33 @@ def main() -> None:
             controller = RobotController(
                 reachy, tracker, is_talking_fn, no_body=args.no_body,
             )
+
+            # Hook bus -> controller: on person_left, trigger a
+            # directed search sweep from the last-known head yaw.
+            def _on_person_left_search(evt):
+                try:
+                    controller.notify_person_lost(controller.snapshot.sent_yaw)
+                except Exception as e:  # pragma: no cover
+                    log.debug("person_lost search hook failed: %s", e)
+            bus.subscribe(EVT_PERSON_LEFT, _on_person_left_search)
+
+            # Hook bus -> controller: on voice_unseen, start a "who
+            # said that?" sweep (currently only fired manually; kept
+            # wired so DOA can publish the same event later).
+            def _on_voice_unseen(evt):
+                try:
+                    guess = evt.payload.get("yaw_rad")
+                    controller.notify_voice_unseen(guess_yaw_rad=guess)
+                except Exception as e:  # pragma: no cover
+                    log.debug("voice_unseen hook failed: %s", e)
+            bus.subscribe(EVT_VOICE_UNSEEN, _on_voice_unseen)
+
+            # Track the currently focused *name* so we only announce
+            # real person-to-person changes to the gaze planner. Raw
+            # track_id flips are noisy (ByteTrack re-IDs the same
+            # person every occlusion) and must not be treated as new
+            # targets.
+            prev_focus_name: Optional[str] = None
 
             last_log = 0.0
             while not stop["flag"]:
@@ -893,14 +1157,57 @@ def main() -> None:
                 det_bbox = det.bbox_px if det is not None else None
 
                 # Apply the current focus intent (person / speaker /
-                # auto) to the cascade tracker's lock. Cheap: only
+                # normal) to the cascade tracker's lock. Cheap: only
                 # reads snapshots produced by other threads.
                 focus_snap: Optional[FocusSnapshot] = None
                 face_snap: list = []
                 if focus_manager is not None:
-                    focus_snap = focus_manager.update(tracker.get_all_tracks())
+                    focus_snap = focus_manager.update(
+                        tracker.get_all_tracks(),
+                        frame_w=frame_w, frame_h=frame_h,
+                    )
+                    # Only hint at a saccade when we switch between
+                    # *named* people -- not on every ByteTrack re-ID.
+                    # The P-controller already handles smooth changes
+                    # to an unnamed / moving target naturally.
+                    if (
+                        focus_snap.focused_name is not None
+                        and focus_snap.focused_name != prev_focus_name
+                        and prev_focus_name is not None
+                        and det is not None
+                    ):
+                        # Target yaw ≈ current head yaw + err mapped
+                        # through the camera's half-FOV. 30° is a
+                        # reasonable approximation for a 60° HFOV lens
+                        # (AVFoundation default); off by <20% of jump
+                        # and natural_gaze only cares about whether
+                        # the jump is above its 8° saccade threshold.
+                        half_fov_rad = math.radians(30.0)
+                        approx_yaw = snap.sent_yaw - det.err_x * half_fov_rad
+                        approx_pitch = snap.sent_pitch + det.err_y * half_fov_rad * 0.6
+                        controller.notify_target_switched(
+                            approx_yaw, approx_pitch,
+                        )
+                    prev_focus_name = focus_snap.focused_name
                 if lip_tracker is not None:
                     face_snap = lip_tracker.snapshot()
+
+                # Humans seen? -> keep idle drift at bay.
+                if focus_snap is not None and focus_snap.name_by_track:
+                    controller.mark_humans_seen()
+                elif tracker.get_all_tracks():
+                    controller.mark_humans_seen()
+
+                # Publish the robot's own pose into WorldState so any
+                # brain reading the snapshot (Gemini tools / future
+                # Hsafa bridge) sees a coherent picture.
+                world.set_robot_pose(
+                    head_yaw_deg=math.degrees(snap.sent_yaw),
+                    head_pitch_deg=math.degrees(snap.sent_pitch),
+                    head_roll_deg=0.0,
+                    body_yaw_deg=math.degrees(snap.body_yaw),
+                    is_speaking=snap.talking,
+                )
 
                 # Heartbeat
                 now = time.time()
@@ -940,6 +1247,12 @@ def main() -> None:
             except Exception as e:
                 log.warning("recenter failed: %s", e)
     finally:
+        if head_pose_tracker is not None:
+            head_pose_tracker.stop(timeout=1.0)
+        if gesture_tracker is not None:
+            gesture_tracker.stop(timeout=1.0)
+        if audio_vad is not None:
+            audio_vad.stop(timeout=1.0)
         if lip_tracker is not None and lip_tracker.is_alive():
             lip_tracker.stop()
             lip_tracker.join(timeout=1.0)
@@ -952,6 +1265,12 @@ def main() -> None:
         if tracker.is_alive():
             tracker.stop()
             tracker.join(timeout=1.0)
+        # Flush any pending voice samples accumulated during cross-modal
+        # enrollment (no-op until the voice embedder lands).
+        if identity_graph is not None:
+            committed = identity_graph.commit_pending_voices()
+            if committed:
+                log.info("IdentityGraph: committed voices for %s", committed)
         if tracker.infer_count:
             avg_ms = tracker.infer_total_ms / tracker.infer_count
             total = sum(tracker.tier_counts.values())

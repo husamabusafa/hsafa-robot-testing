@@ -26,6 +26,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from .animation import IdleAnimation, TalkingAnimation, blend_offsets
+from .natural_gaze import GazeCommand, MotionProfile, NaturalGaze
 from .tracker import CascadeTracker, TIER_COLORS, TIER_NONE, TrackResult
 
 log = logging.getLogger(__name__)
@@ -138,6 +139,14 @@ class RobotController:
         self._anim_blend = 0.0          # 0 = idle, 1 = talking
         self._target_blend = 0.0
 
+        # Natural-gaze motion planner (saccades / micro-saccades /
+        # search / idle drift). All overrides are applied ON TOP of
+        # the P-controller output; the planner itself doesn't move
+        # motors.
+        self._natural_gaze = NaturalGaze()
+        self._last_locked_id: Optional[int] = None
+        self._last_humans_seen_ts = time.time()
+
         # Face-tracking state
         self._cmd_yaw = 0.0
         self._cmd_pitch = 0.0
@@ -157,6 +166,34 @@ class RobotController:
             sent_yaw=0.0, sent_pitch=0.0, body_yaw=0.0,
             antennas=(0.0, 0.0), talking=False,
         )
+
+    # ---- NaturalGaze accessors (for main loop / focus events) ----------
+    @property
+    def natural_gaze(self) -> NaturalGaze:
+        return self._natural_gaze
+
+    def notify_target_switched(
+        self, new_yaw_rad: float, new_pitch_rad: float,
+    ) -> None:
+        """Let the gaze planner know the gaze target just switched.
+
+        Pass the approximate yaw/pitch the head will be aimed at next
+        so the planner can decide saccade vs. smooth pursuit.
+        """
+        self._natural_gaze.notify_target_changed(new_yaw_rad, new_pitch_rad)
+
+    def notify_person_lost(self, last_known_yaw_rad: float) -> None:
+        self._natural_gaze.notify_person_lost(last_known_yaw_rad=last_known_yaw_rad)
+
+    def notify_voice_unseen(self, guess_yaw_rad: Optional[float] = None) -> None:
+        self._natural_gaze.notify_voice_unseen(guess_yaw_rad=guess_yaw_rad)
+
+    def cue_listener_glance(self, other_person_yaw_rad: float) -> None:
+        self._natural_gaze.cue_listener_glance(other_person_yaw_rad)
+
+    def mark_humans_seen(self) -> None:
+        """Called by the main loop while at least one human is visible."""
+        self._last_humans_seen_ts = time.time()
 
     # ---- per-frame tick -------------------------------------------------
     def tick(self, frame) -> ControlSnapshot:
@@ -187,22 +224,66 @@ class RobotController:
             current_id = det.track_id
             have_face = True
 
+        # ---- 1b. Ask the natural-gaze planner for its preference -------
+        # Planner might want to inject a saccade boost, an idle drift
+        # override, a search sweep, or just pass through.
+        no_humans_s = max(0.0, now - self._last_humans_seen_ts)
+        gcmd: GazeCommand = self._natural_gaze.tick(
+            have_target=have_face,
+            current_yaw=self._cmd_yaw,
+            current_pitch=self._cmd_pitch,
+            no_humans_s=no_humans_s,
+        )
+
         # ---- 2. Error smoothing & P-controller --------------------------
         if have_face:
             self._err_x_s = (1 - ERR_ALPHA) * self._err_x_s + ERR_ALPHA * err_x
             self._err_y_s = (1 - ERR_ALPHA) * self._err_y_s + ERR_ALPHA * err_y
 
+        # Track whether the controller is actively moving (for micro-
+        # saccade bookkeeping).
+        was_moving = (
+            abs(self._err_x_s) > DEADZONE or abs(self._err_y_s) > DEADZONE
+        )
+
+        # Gain scale from the planner -- saccades multiply KP for a
+        # ballistic snap; idle drift uses gain 1.0 because it overrides
+        # the target directly.
+        gain = max(0.2, gcmd.gain_scale)
+
         active = have_face or (now - self._last_seen) < COAST_S
-        if active:
+        if gcmd.override_yaw is not None or gcmd.override_pitch is not None:
+            # Absolute override path (idle drift / search / listener glance)
+            # -- ignore P-controller entirely for the overridden axis.
+            if gcmd.override_yaw is not None:
+                target_yaw = gcmd.override_yaw
+                self._cmd_yaw += gain * KP_YAW * (target_yaw - self._cmd_yaw) * STEP_SCALE
+            if gcmd.override_pitch is not None:
+                target_pitch = gcmd.override_pitch
+                self._cmd_pitch += (
+                    gain * KP_PITCH * (target_pitch - self._cmd_pitch) * STEP_SCALE
+                )
+        elif active:
             if abs(self._err_x_s) > DEADZONE:
-                self._cmd_yaw += YAW_SIGN * KP_YAW * self._err_x_s * STEP_SCALE
+                self._cmd_yaw += (
+                    YAW_SIGN * KP_YAW * self._err_x_s * STEP_SCALE * gain
+                )
             if abs(self._err_y_s) > DEADZONE:
-                self._cmd_pitch += PITCH_SIGN * KP_PITCH * self._err_y_s * STEP_SCALE
+                self._cmd_pitch += (
+                    PITCH_SIGN * KP_PITCH * self._err_y_s * STEP_SCALE * gain
+                )
         elif now - self._last_seen > RECENTER_AFTER_S:
             self._err_x_s *= 0.9
             self._err_y_s *= 0.9
             self._cmd_yaw *= 0.95
             self._cmd_pitch *= 0.95
+
+        # Bookkeeping for the planner so micro-saccades know when to
+        # fire.
+        if was_moving:
+            self._natural_gaze.note_motion_active()
+        else:
+            self._natural_gaze.note_motion_settled(now)
 
         self._cmd_yaw = clamp(self._cmd_yaw, -YAW_LIMIT, YAW_LIMIT)
         self._cmd_pitch = clamp(self._cmd_pitch, -PITCH_LIMIT, PITCH_LIMIT)
@@ -242,8 +323,8 @@ class RobotController:
 
         # ---- 5. Compose & send ------------------------------------------
         head_roll = off["roll"]
-        head_pitch = self._sent_pitch + off["pitch"]
-        head_yaw = self._sent_yaw + off["yaw"]
+        head_pitch = self._sent_pitch + off["pitch"] + gcmd.offset_pitch
+        head_yaw = self._sent_yaw + off["yaw"] + gcmd.offset_yaw
 
         # Clamp final commanded angles to stay inside the head workspace.
         head_pitch = clamp(head_pitch, -PITCH_LIMIT, PITCH_LIMIT)

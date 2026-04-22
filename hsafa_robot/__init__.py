@@ -1,15 +1,43 @@
 """hsafa_robot — Reachy Mini runtime services.
 
-Subpackages:
-  - tracker        : YOLOv8-Pose + ByteTrack + Kalman + motion cascade
-  - animation      : Overlay animations (idle / talking)
-  - gemini_live    : Gemini Live API voice+vision session
-  - robot_control  : Combines tracking + animations into robot commands
+Layer map (see docs/architecture.md):
+
+L0  I/O        : reachy_mini (external), OpenCV, GStreamer (via MediaManager)
+L1  Perception : tracker, face_recognizer, lip_motion, audio_vad,
+                 head_pose, gestures
+L2  Cognition  : events (EventBus), world_state (WorldStateHolder),
+                 perception (WorldState builder), gaze_policy
+                 (scoring engine), focus (FocusManager driver),
+                 natural_gaze (saccades / idle drift / search),
+                 identity_graph (face+voice+name link)
+L3  Voice      : gemini_live
+L4  Thinker    : (reserved for future Hsafa Core bridge)
+
+Control / motion:
+  - robot_control : P-controller + NaturalGaze overrides + animations
+  - animation     : idle + talking overlay animations
 """
 
 __all__ = [
+    # L1 perception
     "tracker",
-    "animation",
+    "face_db",
+    "face_recognizer",
+    "lip_motion",
+    "audio_vad",
+    "head_pose",
+    "gestures",
+    # L2 cognition
+    "events",
+    "world_state",
+    "perception",
+    "gaze_policy",
+    "focus",
+    "natural_gaze",
+    "identity_graph",
+    # L3 voice
     "gemini_live",
+    # L0 motion
     "robot_control",
+    "animation",
 ]

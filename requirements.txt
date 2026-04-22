@@ -7,3 +7,8 @@ google-genai>=1.70
 python-dotenv>=1.0
 facenet-pytorch>=2.5
 Pillow>=10.0
+# --- Optional humanoid senses (skip to disable; code degrades gracefully).
+# MediaPipe: head-pose for `is_being_addressed` + hand gesture recognition.
+mediapipe>=0.10
+# Silero VAD: gates lip-motion on real speech (no chewing false-fires).
+silero-vad>=5.0

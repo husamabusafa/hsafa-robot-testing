@@ -94,9 +94,14 @@ Gemini Live (and later Hsafa) calls it via a tool.
 - If no one is speaking, hold the last speaker for ~2 seconds
   (natural, non-jittery), then fall back to `largest`.
 - Source of truth for `is_speaking`:
-  - v1: mouth-region variance over the last ~500 ms (CPU-cheap).
-  - v2: mic-array direction of arrival.
-  - v3: voice embedding → matches name.
+  - v1 (today): mouth-region variance over the last ~500 ms
+    (CPU-cheap, false-fires on chewing / laughing).
+  - **v2: TalkNet** — audio-visual active-speaker detection that
+    fuses the mouth crop with the mic. Single per-face
+    `speaking_prob ∈ [0,1]` replaces v1; everything downstream
+    (`speaker` mode, `who_is_speaking`, auto voice enrollment)
+    reuses the same snapshot shape. See `identity.md` §3.
+  - v3: voice embedding → matches an identity (off-camera speakers).
 
 ### Mode: `free` / `idle`
 - No lock. Head does a slow natural sweep.
