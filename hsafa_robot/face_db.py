@@ -119,6 +119,48 @@ class FaceDB:
                 log.warning("FaceDB: failed to delete %s: %s", key, e)
             return True
 
+    def rename(self, old_name: str, new_name: str) -> bool:
+        """Rename a stored person. Returns True on success.
+
+        If ``new_name`` already exists, we *merge* the two embedding
+        banks (trimmed to the max size) rather than clobber the
+        existing one -- the user asking to "actually it's Husam not
+        Kindom" usually means the two are the same person.
+
+        Fails (returns False) when ``old_name`` doesn't exist or
+        ``new_name`` normalizes to the empty string.
+        """
+        old_key = canonicalize_name(old_name)
+        new_key = canonicalize_name(new_name)
+        if not new_key:
+            log.warning("FaceDB.rename: new_name normalized to empty")
+            return False
+        if old_key == new_key:
+            return True
+        with self._lock:
+            if old_key not in self._data:
+                return False
+            arr = self._data.pop(old_key)
+            existing = self._data.get(new_key)
+            if existing is not None:
+                arr = np.concatenate([existing, arr], axis=0)
+                if arr.shape[0] > MAX_EMBEDDINGS_PER_PERSON:
+                    arr = arr[-MAX_EMBEDDINGS_PER_PERSON:]
+            self._data[new_key] = arr.astype(np.float32, copy=False)
+            # Persist: write the merged file then remove the old one.
+            try:
+                np.save(self.dir / f"{new_key}.npy", self._data[new_key])
+            except Exception as e:
+                log.warning("FaceDB.rename: save %s failed: %s", new_key, e)
+                return False
+            try:
+                (self.dir / f"{old_key}.npy").unlink(missing_ok=True)
+            except Exception as e:
+                log.warning("FaceDB.rename: unlink %s failed: %s", old_key, e)
+            log.info("FaceDB: renamed %r -> %r (%d embeddings)",
+                     old_key, new_key, self._data[new_key].shape[0])
+            return True
+
     def identify(self, emb: np.ndarray) -> Tuple[Optional[str], float]:
         """Return ``(name, similarity)`` or ``(None, best_similarity)`` if below threshold.
 

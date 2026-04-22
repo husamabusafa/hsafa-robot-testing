@@ -20,7 +20,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -199,6 +199,10 @@ class CascadeTracker(threading.Thread):
         self._lock = threading.Lock()
         self._pending_frame: Optional[np.ndarray] = None
         self._latest: Optional[TrackResult] = None
+        # All track_id -> bbox pairs from the most recent YOLO frame.
+        # Consumed by the focus manager to match face-recognizer names
+        # (which live in face-bbox space) to bytetrack IDs.
+        self._latest_tracks: List[Tuple[int, Tuple[int, int, int, int]]] = []
         self._stopped = False
 
         self.infer_count = 0
@@ -224,6 +228,30 @@ class CascadeTracker(threading.Thread):
     def get(self) -> Optional[TrackResult]:
         with self._lock:
             return self._latest
+
+    def get_all_tracks(
+        self,
+    ) -> List[Tuple[int, Tuple[int, int, int, int]]]:
+        """Snapshot of ``(track_id, bbox_xyxy)`` for every person YOLO
+        currently sees. Used by the focus manager to map recognized
+        face names to bytetrack IDs.
+        """
+        with self._lock:
+            # Copy so the caller can read without worrying about the
+            # worker thread mutating the list out from under them.
+            return list(self._latest_tracks)
+
+    def set_locked_id(self, track_id: Optional[int]) -> None:
+        """Externally force the tracker to follow a specific track.
+
+        Passing ``None`` reverts to the default largest-person
+        behavior. The new lock takes effect on the next YOLO frame.
+        """
+        with self._lock:
+            self.locked_id = int(track_id) if track_id is not None else None
+            # Reset the last-seen timer so the new lock gets a full
+            # LOCK_TIMEOUT_S grace period before any auto-recovery.
+            self.last_lock_seen = time.time()
 
     def stop(self) -> None:
         self._stopped = True
@@ -307,6 +335,8 @@ class CascadeTracker(threading.Thread):
             r0 = results[0] if results else None
             boxes_obj = getattr(r0, "boxes", None) if r0 is not None else None
 
+            all_tracks: List[Tuple[int, Tuple[int, int, int, int]]] = []
+
             if (boxes_obj is not None and boxes_obj.xyxy is not None
                     and len(boxes_obj.xyxy) > 0):
                 boxes = boxes_obj.xyxy.cpu().numpy()
@@ -319,6 +349,12 @@ class CascadeTracker(threading.Thread):
                           if (r0.keypoints is not None
                               and r0.keypoints.conf is not None)
                           else None)
+
+                # Expose the full detection list so the focus manager
+                # can match face-recognizer names to bytetrack IDs.
+                for bb, tid in zip(boxes, ids):
+                    bx1, by1, bx2, by2 = (int(v) for v in bb.tolist())
+                    all_tracks.append((int(tid), (bx1, by1, bx2, by2)))
 
                 if (self.locked_id is not None
                         and (ts - self.last_lock_seen) > LOCK_TIMEOUT_S):
@@ -379,3 +415,4 @@ class CascadeTracker(threading.Thread):
 
             with self._lock:
                 self._latest = res
+                self._latest_tracks = all_tracks
