@@ -25,7 +25,7 @@ import math
 import threading
 import time
 import traceback
-from typing import Callable, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
  
 import numpy as np
 from google import genai
@@ -66,6 +66,9 @@ FrameSource = Callable[[], Optional[bytes]]
 MicSource = Callable[[], Optional[np.ndarray]]
 # Accepts a float32 ndarray of shape ``(N,)`` mono at 16 kHz.
 SpeakerSink = Callable[[np.ndarray], None]
+# Async tool handler: given the tool name + args, returns the JSON-
+# serializable response dict that Gemini will see as the tool's output.
+ToolHandler = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
  
  
 # How often to emit a one-line audio health summary (seconds).
@@ -112,6 +115,8 @@ class GeminiLiveSession:
         barge_in_rms: float = 0.03,
         barge_in_min_chunks: int = 3,
         barge_in_hold_s: float = 2.0,
+        tools: Optional[List[Any]] = None,
+        tool_handler: Optional[ToolHandler] = None,
     ) -> None:
         if not api_key:
             raise ValueError("GeminiLiveSession requires a GEMINI_API_KEY")
@@ -131,6 +136,15 @@ class GeminiLiveSession:
         self._speaker_sink = speaker_sink
         self._mic_poll_interval = mic_poll_interval
         self._mic_gate_tail_s = mic_gate_tail_s
+        # Optional Gemini function-calling. ``tools`` is a list of
+        # ``types.Tool`` (each wraps one or more ``FunctionDeclaration``).
+        # ``tool_handler`` is an async callable that receives
+        # ``(name, args)`` and returns the JSON-serializable response.
+        self._tools = list(tools) if tools else None
+        self._tool_handler = tool_handler
+        # Tracks in-flight tool-call tasks so they don't get GC'd and so
+        # we can cancel them cleanly on teardown.
+        self._tool_tasks: set[asyncio.Task] = set()
         # Barge-in threshold, measured as linear RMS (sqrt(mean(arr**2)))
         # of the downmixed float32 mono chunk.
         #
@@ -298,6 +312,8 @@ class GeminiLiveSession:
                 handle=self._resumption_handle,
             ),
         )
+        if self._tools:
+            config.tools = self._tools
         if self._system_instruction:
             config.system_instruction = types.Content(
                 parts=[types.Part(text=self._system_instruction)],
@@ -593,6 +609,22 @@ class GeminiLiveSession:
                         if qsize > stats["queue_peak"]:
                             stats["queue_peak"] = qsize
  
+                    # Tool calls arrive as a top-level field on the message,
+                    # independently of ``server_content``. Dispatch before
+                    # the server_content early-exit so we never drop them.
+                    tc = getattr(msg, "tool_call", None)
+                    if tc is not None and getattr(tc, "function_calls", None):
+                        # Dispatch tool calls in a background task so the
+                        # receive loop keeps pulling audio chunks while
+                        # long-running handlers (e.g. face enrollment)
+                        # are still working.
+                        task = asyncio.create_task(
+                            self._dispatch_tool_call(session, tc),
+                            name="gemini-tool-dispatch",
+                        )
+                        self._tool_tasks.add(task)
+                        task.add_done_callback(self._tool_tasks.discard)
+
                     sc = msg.server_content
                     if sc is None:
                         continue
@@ -634,3 +666,54 @@ class GeminiLiveSession:
                 await asyncio.wait_for(worker, timeout=1.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 worker.cancel()
+
+    # ---- tool calls -----------------------------------------------------
+    async def _dispatch_tool_call(self, session, tool_call) -> None:
+        """Run each function call through ``self._tool_handler`` and reply.
+
+        Gemini Live pauses the model turn until the client posts a
+        ``tool_response`` for every pending call, so we make sure to
+        always send a response -- even if the handler crashes or no
+        handler is configured.
+        """
+        responses = []
+        for fc in tool_call.function_calls:
+            name = getattr(fc, "name", "") or ""
+            # ``fc.args`` is a dict-like proto; coerce to a plain dict so
+            # handlers can use the usual ``.get`` / subscript API.
+            raw_args = getattr(fc, "args", None) or {}
+            try:
+                args: Dict[str, Any] = dict(raw_args)
+            except Exception:
+                args = {}
+
+            if self._tool_handler is None:
+                log.warning("tool_call '%s' but no tool_handler registered", name)
+                result: Dict[str, Any] = {
+                    "ok": False,
+                    "error": "no tool handler configured",
+                }
+            else:
+                try:
+                    result = await self._tool_handler(name, args)
+                except Exception as e:
+                    log.exception("tool_handler('%s') crashed: %s", name, e)
+                    result = {"ok": False, "error": str(e)}
+
+            if not isinstance(result, dict):
+                result = {"ok": True, "value": result}
+
+            log.info("tool_call %s(%s) -> %s", name, args, result)
+
+            responses.append(
+                types.FunctionResponse(
+                    id=getattr(fc, "id", None),
+                    name=name,
+                    response=result,
+                )
+            )
+
+        try:
+            await session.send_tool_response(function_responses=responses)
+        except Exception as e:
+            log.warning("send_tool_response failed: %s", e)

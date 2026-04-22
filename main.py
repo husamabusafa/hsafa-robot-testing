@@ -40,6 +40,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import math
 import os
@@ -47,13 +48,17 @@ import signal
 import sys
 import threading
 import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import cv2
 import numpy as np
 from dotenv import load_dotenv
+from google.genai import types as genai_types
 from reachy_mini import ReachyMini
 
+from hsafa_robot.face_db import FaceDB
+from hsafa_robot.face_recognizer import FaceRecognizer
 from hsafa_robot.gemini_live import GeminiLiveSession
 from hsafa_robot.robot_control import RobotController, head_pose
 from hsafa_robot.tracker import (
@@ -73,8 +78,131 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "Keep replies short, warm, and natural - usually one or two sentences. "
     "You can see the person through your camera; if they show you something, "
     "react to it briefly. Do not narrate your actions; just talk like a "
-    "friendly companion. If you don't know what to say, ask a small question."
+    "friendly companion. If you don't know what to say, ask a small question. "
+    "\n\n"
+    "You can remember people's faces. "
+    "When someone introduces themselves (e.g. says 'I am Husam', "
+    "'my name is X', or 'remember me as Y'), call the `enroll_face` tool "
+    "with their name, then confirm naturally in your reply. "
+    "When someone asks who they are, who you are looking at, or whether "
+    "you recognize them (e.g. 'who am I?', 'do you know me?', "
+    "'remember me?'), call the `identify_person` tool FIRST and use its "
+    "result in your answer. If it returns 'unknown', say you don't "
+    "recognize them and offer to remember their face. "
+    "Always prefer calling these tools over guessing from the image."
 )
+
+
+# --- Face recognition tools ------------------------------------------------
+
+FACE_DB_DIR = Path(__file__).resolve().parent / "data" / "faces"
+
+
+def build_face_tools() -> list:
+    """Gemini Live function declarations for face enroll / identify."""
+    return [
+        genai_types.Tool(
+            function_declarations=[
+                genai_types.FunctionDeclaration(
+                    name="enroll_face",
+                    description=(
+                        "Remember the face of the person currently in front "
+                        "of the robot's camera under the given name. Capture "
+                        "takes a couple of seconds; ask them to hold still "
+                        "and look at the camera while you call this."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={
+                            "name": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description=(
+                                    "The person's name, e.g. 'Husam'. Will "
+                                    "be stored in lowercase."
+                                ),
+                            ),
+                        },
+                        required=["name"],
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="identify_person",
+                    description=(
+                        "Recognize the person currently visible to the "
+                        "camera. Returns the best-matching known name or "
+                        "'unknown'. Call this whenever the user asks 'who "
+                        "am I', 'do you know me', or similar."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="list_known_people",
+                    description=(
+                        "List the names of everyone whose face is already "
+                        "enrolled in memory. Useful when the user asks who "
+                        "you know or remember."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+            ],
+        ),
+    ]
+
+
+def make_tool_handler(
+    recognizer: FaceRecognizer,
+    latest: "LatestFrame",
+):
+    """Build the async tool handler closure Gemini Live will call."""
+
+    async def handler(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        if name == "enroll_face":
+            person = str(args.get("name", "")).strip()
+            if not person:
+                return {"ok": False, "error": "name is required"}
+            # Long-running: offload to a thread so we don't block the
+            # Gemini event loop.
+            count = await asyncio.to_thread(
+                recognizer.enroll, person, latest.get_frame,
+            )
+            if count == 0:
+                return {
+                    "ok": False,
+                    "name": person,
+                    "reason": "no_face_visible",
+                }
+            return {"ok": True, "name": person, "samples_captured": count}
+
+        if name == "identify_person":
+            result_name, similarity, face_found = await asyncio.to_thread(
+                recognizer.identify, latest.get_frame,
+            )
+            if not face_found:
+                return {"ok": False, "reason": "no_face_visible"}
+            if result_name is None:
+                return {
+                    "ok": True,
+                    "name": "unknown",
+                    "best_similarity": round(similarity, 3),
+                }
+            return {
+                "ok": True,
+                "name": result_name,
+                "similarity": round(similarity, 3),
+            }
+
+        if name == "list_known_people":
+            return {"ok": True, "names": recognizer.db.list_names()}
+
+        return {"ok": False, "error": f"unknown tool: {name}"}
+
+    return handler
 
 
 # --- Shared frame buffer ---------------------------------------------------
@@ -216,6 +344,9 @@ def main() -> None:
                         help="Apply CLAHE auto-brightness to camera frames. "
                              "Usually not needed at 480p with AVFoundation; "
                              "enable if the room is poorly lit.")
+    parser.add_argument("--no-face-recognition", action="store_true",
+                        help="Disable face enrollment / identification "
+                             "tools (skips loading FaceNet at startup).")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -231,6 +362,21 @@ def main() -> None:
 
     load_dotenv()
     api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+    # --- Face recognition (optional) -----------------------------------
+    face_recognizer: Optional[FaceRecognizer] = None
+    face_tools: Optional[list] = None
+    if not args.no_face_recognition:
+        face_db = FaceDB(FACE_DB_DIR)
+        # Stay on CPU: the models are small and face tools run on demand
+        # (not every frame), so a GPU is not worth the MPS portability
+        # risk.
+        face_recognizer = FaceRecognizer(face_db, device="cpu")
+        face_tools = build_face_tools()
+        log.info(
+            "Face recognition enabled. Known people: %s",
+            face_db.list_names() or "(none yet)",
+        )
 
     # --- Tracker --------------------------------------------------------
     model_path = ensure_pose_model()
@@ -322,6 +468,11 @@ def main() -> None:
                         mic_source=media.get_audio_sample,
                         speaker_sink=media.push_audio_sample,
                     )
+                    if face_recognizer is not None and face_tools is not None:
+                        kwargs["tools"] = face_tools
+                        kwargs["tool_handler"] = make_tool_handler(
+                            face_recognizer, latest,
+                        )
                     model = args.model or os.environ.get("GEMINI_MODEL")
                     if model:
                         kwargs["model"] = model
