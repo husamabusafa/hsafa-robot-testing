@@ -480,66 +480,72 @@ class GeminiLiveSession:
  
         diag_task = asyncio.create_task(diag_loop(), name="spk-diag")
         try:
-            async for msg in session.receive():
-                if self._stop.is_set():
-                    break
+            while not self._stop.is_set():
+                async for msg in session.receive():
+                    if self._stop.is_set():
+                        break
  
-                # Session-resumption handle (needed for the 10-min cap).
-                sru = msg.session_resumption_update
-                if sru and sru.resumable and sru.new_handle:
-                    self._resumption_handle = sru.new_handle
+                    # Session-resumption handle (needed for the 10-min cap).
+                    sru = msg.session_resumption_update
+                    if sru and sru.resumable and sru.new_handle:
+                        self._resumption_handle = sru.new_handle
  
-                if msg.go_away is not None:
-                    log.info(
-                        "Gemini Live go_away received (time_left=%s); will reconnect",
-                        getattr(msg.go_away, "time_left", None),
-                    )
+                    if msg.go_away is not None:
+                        log.info(
+                            "Gemini Live go_away received (time_left=%s); will reconnect",
+                            getattr(msg.go_away, "time_left", None),
+                        )
  
-                # ``msg.data`` concatenates all inline_data parts.
-                data = msg.data
-                if data:
-                    self.is_speaking.set()
-                    # Hold the mic gate while we're streaming audio out,
-                    # plus a tail so the speaker buffer can drain and
-                    # room echo can decay before we listen again.
-                    self._mic_gate_until = time.monotonic() + self._mic_gate_tail_s
-                    stats["recv_chunks"] += 1
-                    stats["recv_bytes"] += len(data)
-                    try:
-                        playback_q.put_nowait(data)
-                    except asyncio.QueueFull:
-                        stats["dropped"] += 1
+                    # ``msg.data`` concatenates all inline_data parts.
+                    data = msg.data
+                    if data:
+                        self.is_speaking.set()
+                        # Hold the mic gate while we're streaming audio out,
+                        # plus a tail so the speaker buffer can drain and
+                        # room echo can decay before we listen again.
+                        self._mic_gate_until = time.monotonic() + self._mic_gate_tail_s
+                        stats["recv_chunks"] += 1
+                        stats["recv_bytes"] += len(data)
                         try:
-                            playback_q.get_nowait()
-                        except asyncio.QueueEmpty:
-                            pass
-                        playback_q.put_nowait(data)
-                    qsize = playback_q.qsize()
-                    if qsize > stats["queue_peak"]:
-                        stats["queue_peak"] = qsize
+                            playback_q.put_nowait(data)
+                        except asyncio.QueueFull:
+                            stats["dropped"] += 1
+                            try:
+                                playback_q.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            playback_q.put_nowait(data)
+                        qsize = playback_q.qsize()
+                        if qsize > stats["queue_peak"]:
+                            stats["queue_peak"] = qsize
  
-                sc = msg.server_content
-                if sc is None:
-                    continue
-                if sc.interrupted:
-                    # User barged in: drop anything not yet handed to the
-                    # sink so the old reply doesn't keep playing over them.
-                    self.is_speaking.clear()
-                    stats["interruptions"] += 1
-                    drained = 0
-                    while not playback_q.empty():
-                        try:
-                            playback_q.get_nowait()
-                            drained += 1
-                        except asyncio.QueueEmpty:
-                            break
-                    log.info(
-                        "Gemini interrupted (barge-in); drained %d chunks",
-                        drained,
-                    )
-                if sc.turn_complete:
-                    self.is_speaking.clear()
-                    stats["turns"] += 1
+                    sc = msg.server_content
+                    if sc is None:
+                        continue
+                    if sc.interrupted:
+                        # User barged in: drop anything not yet handed to the
+                        # sink so the old reply doesn't keep playing over them.
+                        self.is_speaking.clear()
+                        stats["interruptions"] += 1
+                        drained = 0
+                        while not playback_q.empty():
+                            try:
+                                playback_q.get_nowait()
+                                drained += 1
+                            except asyncio.QueueEmpty:
+                                break
+                        log.info(
+                            "Gemini interrupted (barge-in); drained %d chunks",
+                            drained,
+                        )
+                    if sc.turn_complete:
+                        self.is_speaking.clear()
+                        stats["turns"] += 1
+                # ``async for`` ended without an exception: the server
+                # closed this turn's stream. Re-enter for the next turn.
+                log.debug(
+                    "session.receive() generator exhausted; reopening for next turn"
+                )
         finally:
             diag_task.cancel()
             try:
