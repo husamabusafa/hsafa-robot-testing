@@ -2,10 +2,10 @@
 SAM 3 -> Reachy Mini head follow
 ================================
 
-Minimal wiring between the three SAM 3 followers in this folder and the
-real Reachy Mini head motors.  No body yaw, no antennas, no animations,
-no natural-gaze planner.  One thread runs perception, one thread runs the
-preview/control loop, and every tick at ~30 Hz we do:
+Minimal wiring between the SAM 3 native video predictor and the real
+Reachy Mini head motors.  No body yaw, no antennas, no animations.  One
+thread runs perception, one thread runs the preview/control loop, and
+every tick at ~30 Hz we do:
 
     bbox center - frame center -> normalized error (-1 .. +1)
     EMA smooth the error
@@ -13,30 +13,16 @@ preview/control loop, and every tick at ~30 Hz we do:
     clamp to the head workspace
     reachy.set_target(head=4x4_pose)
 
-SAM 3 on MPS runs at roughly 2-3 Hz; the control loop still runs at 30 Hz
-because perception and motor control are deliberately decoupled.  Between
-SAM updates the last bbox stays valid, and as the head turns, the camera
-on top of it sees the person drift toward the frame center - classic
-visual servoing, slow detection plus fast closed-loop control.
-
-Which perception layer drives the motors is selected with `--tracker`:
-
-    native   SAM 3.1 native video predictor (no external SOT).  Default.
-             Simple, slowest (~2.5 Hz), lowest appearance-based drift.
-    vit      SAM 3.1 detector + OpenCV TrackerVit (~30 Hz between SAM
-             re-grounds every 0.8 s).  Smooth bbox, higher effective rate.
-    csrt     SAM 3.1 detector + OpenCV CSRT (same cadence, classic SOT).
+SAM 3 on MPS runs at roughly 2-3 Hz; the control loop still runs at
+30 Hz because perception and motor control are deliberately decoupled.
 
 Run:
 
-    # real robot, daemon on localhost, native tracker (default):
+    # real robot, daemon on localhost:
     .venv/bin/python3 examples/sam3_reachy_follow.py --concept person
 
-    # with the ViT hybrid (often feels best for head-follow):
-    .venv/bin/python3 examples/sam3_reachy_follow.py --tracker vit
-
     # no robot - preview + control math only, no commands sent:
-    .venv/bin/python3 examples/sam3_reachy_follow.py --no-reachy --tracker vit
+    .venv/bin/python3 examples/sam3_reachy_follow.py --no-reachy
 
     # spawn a simulated daemon in-process:
     .venv/bin/python3 examples/sam3_reachy_follow.py --sim
@@ -54,7 +40,6 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -65,82 +50,44 @@ import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-# Only the camera helpers are shared / imported at module top. The follower
-# itself is built lazily in `build_follower()` based on the --tracker flag
-# so loading SAM 3 weights (several GB) only happens once, for the chosen
-# variant.
 from sam3_native_tracker import (
     BBox,
+    FollowState,
+    Sam3NativeFollower,
     discover_cameras,
     pick_default_camera,
 )
 
-# Mapping between the FollowState enum names every follower exposes and
-# user-visible colors.  We do NOT import FollowState directly - each tracker
-# module defines its own enum class with the same names, and we compare by
-# `.name` so the App code is tracker-agnostic.
-STATE_NAMES = ("IDLE", "LOCKING", "TRACKING", "LOST")
 STATE_COLORS = {
-    "IDLE": "gray",
-    "LOCKING": "orange",
-    "TRACKING": "lime green",
-    "LOST": "red",
+    FollowState.IDLE: "gray",
+    FollowState.LOCKING: "orange",
+    FollowState.TRACKING: "lime green",
+    FollowState.LOST: "red",
 }
 
 
-class FollowerProtocol:
-    """Typing-only protocol so App.__init__ can be tracker-agnostic.  Both
-    `sam3_native_tracker.Sam3NativeFollower` and `sam3_tracker.Sam3Follower`
-    already satisfy this shape."""
-
-    def start_following(self, concept: str) -> None: ...
-    def stop_following(self) -> None: ...
-    def push_frame(self, frame_bgr: np.ndarray) -> None: ...
-    def get_current_bbox(self): ...
-    def get_stats(self) -> dict: ...
-    def close(self) -> None: ...
-
-
-def build_follower(kind: str) -> tuple[FollowerProtocol, str]:
-    """Build the follower for the requested tracker kind.
-
-    Returns (follower, human_readable_label).
-    """
-    kind = kind.lower()
-    if kind == "native":
-        from sam3_native_tracker import Sam3NativeFollower
-
-        return Sam3NativeFollower(), "SAM 3 native (no external SOT)"
-
-    if kind == "vit":
-        from sam3_tracker import Sam3Follower, Sam3Segmenter
-        from sam3_vit_tracker import make_vit_factory
-
-        segmenter = Sam3Segmenter()
-        vit_factory = make_vit_factory()
-        follower = Sam3Follower(
-            segmenter, tracker_factory=vit_factory, tracker_name="ViT"
-        )
-        return follower, "SAM 3 + ViT tracker"
-
-    if kind == "csrt":
-        from sam3_tracker import Sam3Follower, Sam3Segmenter
-
-        segmenter = Sam3Segmenter()
-        follower = Sam3Follower(segmenter)  # default factory = CSRT
-        return follower, "SAM 3 + CSRT tracker"
-
-    raise ValueError(f"unknown --tracker {kind!r}; expected native|vit|csrt")
-
+# ---------------------------------------------------------------------------
+# Camera intrinsics.  Only the horizontal FOV is a real knob; vertical is
+# derived per-frame from the aspect ratio.  MEASURE this on the actual
+# Reachy Mini camera (see docs / Phase 5 tuning) — the default is a
+# generic webcam guess.  Wrong FOV → head over-/under-shoots when the
+# body pans.
+# ---------------------------------------------------------------------------
+HORIZONTAL_FOV_RAD = math.radians(66)
 
 # ---------------------------------------------------------------------------
-# Control tuning.  Defaults match hsafa_robot/robot_control.py so the "feel"
-# is consistent with the rest of the codebase.  These are conservative - if
-# the head looks lazy, bump KP_* up.  If it oscillates, bump CMD_ALPHA down.
+# Control tuning — world-frame controller.
+#
+# The head is commanded toward a world-frame target yaw/pitch.  Each SAM
+# update reports where the target is relative to the camera; we convert
+# that to an angular error, add the current head angle, and EMA that
+# value into the world target.  The command = world target, clamped to
+# the workspace.  Because the world target is independent of where the
+# head is currently pointing, head motion doesn't create a feedback loop.
 # ---------------------------------------------------------------------------
-KP_YAW = 0.6          # radians of command per unit of normalized error
-KP_PITCH = 0.4
-STEP_SCALE = 0.2      # fraction of the KP*err step applied per tick
+WORLD_ALPHA = 0.25                   # EMA factor when adopting a new world target
+DEADZONE_RAD = math.radians(1.5)     # don't fight sub-1.5° errors
+RECENTER_DECAY = 0.97                # per-tick decay when no target (slow)
 
 # Sign conventions for Reachy Mini with the raw, un-mirrored camera:
 #   image +x = right, image +y = down
@@ -153,16 +100,8 @@ PITCH_SIGN = +1.0
 YAW_LIMIT = math.radians(60)
 PITCH_LIMIT = math.radians(30)
 
-# EMA smoothing.  Higher alpha = snappier response, lower = smoother.
-ERR_ALPHA = 0.6       # smooths noisy bbox centers before feeding the P-ctrl
-CMD_ALPHA = 0.4       # smooths the command we actually send to the motors
-
-# Small dead-band so we don't hunt on sub-pixel error.
-DEADZONE = 0.03
-
-# How long to coast on a stale bbox before decaying back to center.
+# How long to coast on a stale bbox before treating it as "no target".
 COAST_S = 0.8
-RECENTER_DECAY = 0.95 # per-tick multiplier when no target
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -228,98 +167,102 @@ def _head_pose_rpy(roll_rad: float, pitch_rad: float, yaw_rad: float) -> np.ndar
 
 
 # ---------------------------------------------------------------------------
-# The controller itself.  One public method: `step(bbox, frame_hw, have_target)`
-# returns (yaw, pitch) rad so the caller can both render them and send them.
+# World-frame head controller.
+#
+# The bbox center is converted to an *angular* target in the world frame
+# (independent of where the head is currently pointing).  The commanded
+# head angle then approaches that world target every tick via an EMA.
+# When the head turns, the world target doesn't move — only the
+# camera-frame pixel position does.  That cancels cleanly, which is the
+# ego-motion compensation.  No separate `fresh` gate is needed: whether
+# SAM updates at 2 Hz or 4 Hz, the world target is whatever SAM last
+# reported, and the command smoothly approaches it at the 30 Hz tick
+# rate.
 # ---------------------------------------------------------------------------
 @dataclass
 class ControlSnap:
-    err_x: float
-    err_y: float
-    cmd_yaw: float
+    err_yaw_rad: float       # angular error in the camera frame
+    err_pitch_rad: float
+    cmd_yaw: float           # commanded head yaw (world frame, radians)
     cmd_pitch: float
     have_target: bool
 
 
 class HeadFollower:
     def __init__(self) -> None:
-        self._err_x_s = 0.0
-        self._err_y_s = 0.0
-        self._cmd_yaw = 0.0
+        self._target_yaw_world = 0.0    # where we want to look (world frame)
+        self._target_pitch_world = 0.0
+        self._cmd_yaw = 0.0             # what we'll send to the motor
         self._cmd_pitch = 0.0
-        self._sent_yaw = 0.0
-        self._sent_pitch = 0.0
 
     def reset(self) -> None:
-        self._err_x_s = 0.0
-        self._err_y_s = 0.0
+        self._target_yaw_world = 0.0
+        self._target_pitch_world = 0.0
         self._cmd_yaw = 0.0
         self._cmd_pitch = 0.0
-        self._sent_yaw = 0.0
-        self._sent_pitch = 0.0
 
     def step(
         self,
         bbox: Optional[BBox],
         frame_hw: tuple[int, int],
         have_target: bool,
-        fresh: bool,
     ) -> ControlSnap:
-        """One control tick.
-
-        Parameters
-        ----------
-        bbox, frame_hw, have_target
-            Latest target state from the follower.
-        fresh
-            True only when the follower produced a NEW bbox since the last
-            call. SAM 3 runs at ~2.5 Hz; this tick loop runs at 30 Hz. If we
-            integrated the P-step every tick, the same error would compound
-            12x per real sample and the head would overshoot badly. Instead
-            we only integrate on fresh evidence. Between updates we hold
-            `_cmd_*` steady and let the CMD_ALPHA smoothing carry the motors
-            the rest of the way.
-        """
         H, W = frame_hw
-        err_x = err_y = 0.0
-        if bbox is not None:
+        v_fov = HORIZONTAL_FOV_RAD * (H / W)
+
+        err_yaw_cam = 0.0
+        err_pitch_cam = 0.0
+
+        if have_target and bbox is not None:
+            # 1. Where is the target in camera-frame angles?
             cx = (bbox[0] + bbox[2]) / 2.0
             cy = (bbox[1] + bbox[3]) / 2.0
-            # Normalized error: 0 = centered, +/-1 = edge of frame.
-            err_x = float((cx / max(1, W) - 0.5) * 2.0)
-            err_y = float((cy / max(1, H) - 0.5) * 2.0)
+            err_x_px = cx - W / 2.0
+            err_y_px = cy - H / 2.0
+            err_yaw_cam = err_x_px / W * HORIZONTAL_FOV_RAD
+            err_pitch_cam = err_y_px / H * v_fov
 
-        if have_target and fresh:
-            # New SAM sample -> one proportional nudge.
-            self._err_x_s = (1 - ERR_ALPHA) * self._err_x_s + ERR_ALPHA * err_x
-            self._err_y_s = (1 - ERR_ALPHA) * self._err_y_s + ERR_ALPHA * err_y
+            # 2. Target in WORLD frame = current head angle + target offset.
+            #    This is the ego-motion comp, in one line.
+            new_target_yaw = self._cmd_yaw + YAW_SIGN * err_yaw_cam
+            new_target_pitch = self._cmd_pitch + PITCH_SIGN * err_pitch_cam
 
-            if abs(self._err_x_s) > DEADZONE:
-                self._cmd_yaw += YAW_SIGN * KP_YAW * self._err_x_s * STEP_SCALE
-            if abs(self._err_y_s) > DEADZONE:
-                self._cmd_pitch += PITCH_SIGN * KP_PITCH * self._err_y_s * STEP_SCALE
-        elif not have_target:
-            # Tracker lost / released: decay toward center slowly.
-            self._err_x_s *= RECENTER_DECAY
-            self._err_y_s *= RECENTER_DECAY
-            self._cmd_yaw *= RECENTER_DECAY
-            self._cmd_pitch *= RECENTER_DECAY
-        # else: have_target && not fresh -> hold. The command stays put.
+            # 3. Deadzone — don't chase tiny errors.
+            if (
+                abs(err_yaw_cam) > DEADZONE_RAD
+                or abs(err_pitch_cam) > DEADZONE_RAD
+            ):
+                self._target_yaw_world = (
+                    (1 - WORLD_ALPHA) * self._target_yaw_world
+                    + WORLD_ALPHA * new_target_yaw
+                )
+                self._target_pitch_world = (
+                    (1 - WORLD_ALPHA) * self._target_pitch_world
+                    + WORLD_ALPHA * new_target_pitch
+                )
+        else:
+            # No target — decay back to center slowly.
+            self._target_yaw_world *= RECENTER_DECAY
+            self._target_pitch_world *= RECENTER_DECAY
 
-        self._cmd_yaw = _clamp(self._cmd_yaw, -YAW_LIMIT, YAW_LIMIT)
-        self._cmd_pitch = _clamp(self._cmd_pitch, -PITCH_LIMIT, PITCH_LIMIT)
-
-        # The outgoing smoothing runs every tick. That's what turns the
-        # discrete per-sample nudges into continuous motor motion.
-        self._sent_yaw = (1 - CMD_ALPHA) * self._sent_yaw + CMD_ALPHA * self._cmd_yaw
-        self._sent_pitch = (
-            (1 - CMD_ALPHA) * self._sent_pitch + CMD_ALPHA * self._cmd_pitch
+        # 4. Clamp to workspace.
+        self._target_yaw_world = _clamp(
+            self._target_yaw_world, -YAW_LIMIT, YAW_LIMIT
+        )
+        self._target_pitch_world = _clamp(
+            self._target_pitch_world, -PITCH_LIMIT, PITCH_LIMIT
         )
 
+        # 5. Commanded angle = world target.  The EMA above already
+        #    provides smooth approach, so no second smoothing is needed.
+        self._cmd_yaw = self._target_yaw_world
+        self._cmd_pitch = self._target_pitch_world
+
         return ControlSnap(
-            err_x=self._err_x_s,
-            err_y=self._err_y_s,
-            cmd_yaw=self._sent_yaw,
-            cmd_pitch=self._sent_pitch,
+            err_yaw_rad=err_yaw_cam,
+            err_pitch_rad=err_pitch_cam,
+            cmd_yaw=self._cmd_yaw,
+            cmd_pitch=self._cmd_pitch,
             have_target=have_target,
         )
 
@@ -339,7 +282,7 @@ class App:
     def __init__(
         self,
         root: tk.Tk,
-        follower: FollowerProtocol,
+        follower: Sam3NativeFollower,
         follower_label: str,
         controller: HeadFollower,
         reachy,
@@ -354,14 +297,7 @@ class App:
         self.reachy = reachy
         self.reachy_label = reachy_label
         self._photo: Optional[ImageTk.PhotoImage] = None
-        # Timestamp of the most recent SAM update we've already "consumed"
-        # with a P-step. On each tick we compare against the follower's
-        # current update timestamp (derived from `age`); only when it has
-        # advanced do we consider the sample fresh and integrate.
-        self._last_consumed_update_ts: float = 0.0
         self._drive_enabled = tk.BooleanVar(value=True)
-        # Lock to avoid races between camera tick and controller reset
-        self._reset_lock = threading.Lock()
 
         self.cameras = discover_cameras()
         print(f"[camera] Detected: {self.cameras}")
@@ -468,23 +404,17 @@ class App:
         if not concept:
             self._set_status("Type a concept first.", "orange")
             return
-        with self._reset_lock:
-            self.controller.reset()
-            self._last_consumed_update_ts = 0.0
+        self.controller.reset()
         self.follower.start_following(concept)
         self._set_status(f"Locking on '{concept}' ...", "blue")
 
     def _on_release(self) -> None:
         self.follower.stop_following()
-        with self._reset_lock:
-            self._last_consumed_update_ts = 0.0
         self._set_status("Released - head will decay to center.", "black")
 
     def _on_home(self) -> None:
         """Hard-snap the head to neutral.  Useful after a bad tune."""
-        with self._reset_lock:
-            self.controller.reset()
-            self._last_consumed_update_ts = 0.0
+        self.controller.reset()
         try:
             self.reachy.set_target(head=_head_pose_rpy(0.0, 0.0, 0.0))
         except Exception as e:
@@ -503,32 +433,17 @@ class App:
         H, W = frame.shape[:2]
         self.follower.push_frame(frame)
         f_state, bbox, age = self.follower.get_current_bbox()
-        now = time.time()
-
-        # Derive the timestamp of the follower's latest bbox from `age`.
-        # `age` only shrinks when a new sample arrives, so a larger
-        # `update_ts` than the one we last consumed means "fresh data".
-        if bbox is not None and age != float("inf"):
-            update_ts = now - age
-        else:
-            update_ts = 0.0
 
         # have_target: we have a recent bbox and the follower is in an
         # active state.  LOST keeps the last bbox but shouldn't steer the
-        # head any more - only decay.  We compare state by .name so this
-        # App works with either follower's FollowState enum.
-        state_name = f_state.name
+        # head any more - only decay.
         have_target = (
             bbox is not None
-            and state_name == "TRACKING"
+            and f_state == FollowState.TRACKING
             and age < COAST_S
         )
 
-        with self._reset_lock:
-            fresh = update_ts > self._last_consumed_update_ts + 1e-4
-            if fresh:
-                self._last_consumed_update_ts = update_ts
-            snap = self.controller.step(bbox, (H, W), have_target, fresh=fresh)
+        snap = self.controller.step(bbox, (H, W), have_target)
 
         # Send to Reachy (or the null gateway when --no-reachy).
         if self._drive_enabled.get():
@@ -553,7 +468,7 @@ class App:
             display = frame.copy() if bbox is not None else frame
             disp_w, disp_h = W, H
 
-        if bbox is not None and state_name in ("TRACKING", "LOST"):
+        if bbox is not None and f_state in (FollowState.TRACKING, FollowState.LOST):
             if scale != 1.0 and display is frame:
                 display = cv2.resize(
                     frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA
@@ -562,7 +477,7 @@ class App:
             y1 = int(round(bbox[1] * scale))
             x2 = int(round(bbox[2] * scale))
             y2 = int(round(bbox[3] * scale))
-            color = (0, 255, 0) if state_name == "TRACKING" else (0, 0, 255)
+            color = (0, 255, 0) if f_state == FollowState.TRACKING else (0, 0, 255)
             cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
@@ -582,28 +497,23 @@ class App:
             )
 
         self._set_status(
-            f"State: {state_name}  age={age:.2f}s",
-            STATE_COLORS.get(state_name, "black"),
+            f"State: {f_state.name}  age={age:.2f}s",
+            STATE_COLORS.get(f_state, "black"),
         )
 
         st = self.follower.get_stats()
         med_ms = st.get("median_ms", 0.0)
         fps = (1000.0 / med_ms) if med_ms else 0.0
-        # `obj_id` is native-follower specific; `score` is CSRT/ViT specific.
-        # Show whichever the active follower provides.
-        if "obj_id" in st:
-            tracker_bit = f"obj_id={st.get('obj_id')}"
-        else:
-            score = st.get("score", 0.0)
-            tracker_bit = f"score={score:.2f}"
+        tracker_bit = f"obj_id={st.get('obj_id')}"
         self.stats_label.config(
             text=(
                 f"Reachy: {self.reachy_label}  |  "
                 f"{self.follower_label} {med_ms:.0f} ms ({fps:.1f} fps) "
                 f"{tracker_bit}  |  "
-                f"err=({snap.err_x:+.2f}, {snap.err_y:+.2f})  "
-                f"cmd yaw={math.degrees(snap.cmd_yaw):+5.1f}deg "
-                f"pitch={math.degrees(snap.cmd_pitch):+5.1f}deg  "
+                f"err=({math.degrees(snap.err_yaw_rad):+5.1f}°, "
+                f"{math.degrees(snap.err_pitch_rad):+5.1f}°)  "
+                f"cmd yaw={math.degrees(snap.cmd_yaw):+5.1f}° "
+                f"pitch={math.degrees(snap.cmd_pitch):+5.1f}°  "
                 f"drive={'on' if self._drive_enabled.get() else 'off'}"
             )
         )
@@ -663,19 +573,11 @@ def main() -> None:
         action="store_true",
         help="Don't auto-pick the Reachy Mini camera (use laptop cam instead).",
     )
-    ap.add_argument(
-        "--tracker",
-        choices=("native", "vit", "csrt"),
-        default="native",
-        help=(
-            "Which perception layer to use. 'native' = SAM 3 video tracker, "
-            "'vit' = SAM 3 + OpenCV TrackerVit, 'csrt' = SAM 3 + CSRT."
-        ),
-    )
     args = ap.parse_args()
 
-    print(f"[startup] Building follower: --tracker {args.tracker} ...")
-    follower, follower_label = build_follower(args.tracker)
+    print("[startup] Building follower ...")
+    follower = Sam3NativeFollower()
+    follower_label = "SAM 3 native"
     controller = HeadFollower()
 
     print("[startup] Opening Reachy gateway ...")
