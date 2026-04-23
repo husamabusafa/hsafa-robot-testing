@@ -16,6 +16,14 @@ Each detection is:
 2. Emitted as a ``gesture_detected`` event on the :class:`EventBus`
    so other subscribers (say, a future Hsafa bridge) can react.
 
+When a ``point`` is detected we also compute which visible body
+the pointing finger is aimed at (by extending the
+``INDEX_PIP -> INDEX_TIP`` vector and finding the first body bbox
+the ray enters) and expose it as :meth:`GestureTracker.get_point_hint`.
+That hint is the key signal for disambiguating
+``enroll_face("this is my friend Ahmad")`` when multiple people
+are visible.
+
 Optional dependency: ``mediapipe``. When missing, :attr:`enabled`
 stays False and the tracker thread never starts -- the rest of the
 robot keeps working unaffected.
@@ -73,6 +81,29 @@ class _HandTrack:
     last_static_emit: Dict[str, float] = field(default_factory=dict)
 
 
+@dataclass
+class PointHint:
+    """Most recent pointing gesture and who it targets.
+
+    ``pointer_tid`` is the YOLO body whose hand is doing the point
+    (may be ``None`` if we couldn't associate the hand with a body).
+    ``pointed_at_tid`` is the body the finger's ray hits first
+    (``None`` means it points off-frame or only at the pointer's
+    own body). ``pointed_at_bbox`` is cached for callers that need
+    to match a face to the target without re-querying YOLO.
+    """
+    ts: float
+    pointer_tid: Optional[int]
+    pointed_at_tid: Optional[int]
+    pointed_at_bbox: Optional[Bbox]
+    tip_px: Tuple[float, float]             # pixel coords
+    direction: Tuple[float, float]          # unit vector in pixel frame
+
+    def is_fresh(self, max_age_s: float = 1.0, now: Optional[float] = None) -> bool:
+        now = now if now is not None else time.monotonic()
+        return (now - self.ts) <= max_age_s
+
+
 class GestureTracker:
     """Background thread stamping gestures on to body tracks + emitting events."""
 
@@ -100,6 +131,19 @@ class GestureTracker:
         # hand of the same label in the frame is treated as a new track.
         # Good enough for one-person-at-a-time waving.
         self._tracks: Dict[str, _HandTrack] = {}
+        # Most recent pointing hint (published for the enroll-face
+        # disambiguator in main.py).
+        self._last_point: Optional[PointHint] = None
+        self._point_lock = threading.Lock()
+
+    # ---- public accessors ----------------------------------------
+    def get_point_hint(self, max_age_s: float = 1.0) -> Optional[PointHint]:
+        """Return the most recent ``point`` gesture hint if still fresh."""
+        with self._point_lock:
+            hint = self._last_point
+        if hint is None or not hint.is_fresh(max_age_s):
+            return None
+        return hint
 
     # ---- lifecycle ------------------------------------------------
     def start(self) -> None:
@@ -212,6 +256,18 @@ class GestureTracker:
             if best_tid is not None:
                 gestures_by_tid.setdefault(best_tid, []).extend(combined)
 
+            # Compute + stash the pointing hint so enroll_face can
+            # disambiguate. Runs on every ``point`` detection; the
+            # latest one wins.
+            if "point" in static_gestures:
+                hint = _compute_point_hint(
+                    hand_lm.landmark, w, h, yolo,
+                    pointer_tid=best_tid, now=now,
+                )
+                if hint is not None:
+                    with self._point_lock:
+                        self._last_point = hint
+
             # Emit events for first-occurrence gestures (per cooldown).
             for g in combined:
                 last = track.last_static_emit.get(g, 0.0)
@@ -311,3 +367,83 @@ def _match_bbox_to_body(
     if best_score < 0.3 or best_tid == -1:
         return None
     return best_tid
+
+
+def _ray_bbox_entry_t(
+    ox: float, oy: float,
+    dx: float, dy: float,
+    bbox: Bbox,
+) -> Optional[float]:
+    """Parametric t at which ray (o + t*d) enters ``bbox`` (t >= 0), or None.
+
+    Standard 2D slab intersection test. If the ray never enters the
+    box in the forward direction, returns ``None``. Used to find the
+    first body a pointing finger is aimed at.
+    """
+    x1, y1, x2, y2 = bbox
+    t_min = 0.0
+    t_max = float("inf")
+    for o, d, lo, hi in ((ox, dx, x1, x2), (oy, dy, y1, y2)):
+        if abs(d) < 1e-6:
+            if o < lo or o > hi:
+                return None
+            continue
+        t1 = (lo - o) / d
+        t2 = (hi - o) / d
+        if t1 > t2:
+            t1, t2 = t2, t1
+        t_min = max(t_min, t1)
+        t_max = min(t_max, t2)
+        if t_min > t_max:
+            return None
+    return t_min if t_min >= 0.0 else None
+
+
+def _compute_point_hint(
+    lms,
+    frame_w: int,
+    frame_h: int,
+    yolo: List[Tuple[int, Bbox]],
+    *,
+    pointer_tid: Optional[int],
+    now: float,
+) -> Optional[PointHint]:
+    """Trace a ray from index_PIP -> index_TIP and find the first body it hits.
+
+    Bodies associated with ``pointer_tid`` are ignored -- you can
+    only point AT someone else, not yourself.
+    """
+    tip = lms[LM_INDEX_TIP]
+    pip = lms[LM_INDEX_PIP]
+    tip_x, tip_y = tip.x * frame_w, tip.y * frame_h
+    pip_x, pip_y = pip.x * frame_w, pip.y * frame_h
+    dx = tip_x - pip_x
+    dy = tip_y - pip_y
+    norm = math.hypot(dx, dy)
+    if norm < 1e-3:
+        return None
+    dx /= norm
+    dy /= norm
+
+    best_t: Optional[float] = None
+    best_tid: Optional[int] = None
+    best_bbox: Optional[Bbox] = None
+    for tid, body in yolo:
+        if pointer_tid is not None and tid == pointer_tid:
+            continue
+        t = _ray_bbox_entry_t(tip_x, tip_y, dx, dy, body)
+        if t is None:
+            continue
+        if best_t is None or t < best_t:
+            best_t = t
+            best_tid = tid
+            best_bbox = body
+
+    return PointHint(
+        ts=now,
+        pointer_tid=pointer_tid,
+        pointed_at_tid=best_tid,
+        pointed_at_bbox=best_bbox,
+        tip_px=(tip_x, tip_y),
+        direction=(dx, dy),
+    )

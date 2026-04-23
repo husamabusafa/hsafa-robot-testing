@@ -60,6 +60,7 @@ from reachy_mini import ReachyMini
 from hsafa_robot.audio_vad import SileroVAD
 from hsafa_robot.events import (
     EVT_PERSON_LEFT,
+    EVT_VOICE_IDENTIFIED,
     EVT_VOICE_UNSEEN,
     EventBus,
 )
@@ -81,6 +82,8 @@ from hsafa_robot.tracker import (
     ensure_pose_model,
     pick_device,
 )
+from hsafa_robot.voice_embedder import VoiceEmbedder
+from hsafa_robot.voice_identity import VoiceIdentityWorker
 from hsafa_robot.world_state import WorldStateHolder
 
 log = logging.getLogger("hsafa_robot.main")
@@ -123,7 +126,12 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "- `focus_on_person(name)` locks the head and body onto that "
     "known person, even if they move across the frame. Use it when "
     "the user says 'look at me', 'focus on Husam', 'keep your eyes "
-    "on him'.\n"
+    "on him'. It also accepts names that aren't visible right now - "
+    "the lock arms immediately and engages the moment that person "
+    "steps into frame, so 'when Husam comes in, look at him' works "
+    "without waiting. The response includes `visible_now` so you "
+    "know whether to say 'got it, watching you' or 'okay, I'll look "
+    "for Husam'.\n"
     "- `focus_on_speaker()` makes the robot automatically turn "
     "toward whoever is currently talking. Use it for 'look at "
     "whoever is speaking', 'turn to the person talking'.\n"
@@ -150,6 +158,17 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "here, who's addressing you, what gestures are up, what gaze "
     "mode you're in) you can call `describe_scene()` -- it returns "
     "a compact one-line summary of the live WorldState."
+    "\n\n"
+    "The robot can also recognise people by their voice (via a "
+    "learned speaker embedding) even when they are off-camera. "
+    "`describe_scene()` surfaces the most recent recognized voice "
+    "under `env.last_heard_voice_name`. If you hear a familiar "
+    "voice but the person is not in frame, you can acknowledge "
+    "them by name (\"hey Husam, I hear you\") and they can ask you "
+    "to look for them. Voice banks are built automatically: the "
+    "first few times someone who already has an enrolled face "
+    "speaks in front of the camera, their voice signature is "
+    "captured silently -- no explicit command needed."
 )
 
 
@@ -167,10 +186,20 @@ def build_face_tools() -> list:
                 genai_types.FunctionDeclaration(
                     name="enroll_face",
                     description=(
-                        "Remember the face of the person currently in front "
-                        "of the robot's camera under the given name. Capture "
-                        "takes a couple of seconds; ask them to hold still "
-                        "and look at the camera while you call this."
+                        "Remember the face of a person visible to the "
+                        "camera under the given name. Capture takes a "
+                        "couple of seconds. If several people are in "
+                        "frame you can disambiguate with `position` "
+                        "('left' / 'center' / 'right') or `who` ('me' "
+                        "for whoever is speaking, 'other' for the "
+                        "non-speaking newcomer, 'pointed' if the user "
+                        "is pointing at them). When the user is "
+                        "introducing someone - e.g. 'this is my friend "
+                        "Ahmad' - the safest defaults are "
+                        "`who='pointed'` if they're pointing, else "
+                        "`who='other'`, else ask which position. If no "
+                        "hint is given and only one person is unknown, "
+                        "that unknown person is enrolled automatically."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
@@ -178,8 +207,25 @@ def build_face_tools() -> list:
                             "name": genai_types.Schema(
                                 type=genai_types.Type.STRING,
                                 description=(
-                                    "The person's name, e.g. 'Husam'. Will "
-                                    "be stored in lowercase."
+                                    "The person's name, e.g. 'Husam'. "
+                                    "Will be stored in lowercase."
+                                ),
+                            ),
+                            "position": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description=(
+                                    "Optional horizontal hint: 'left', "
+                                    "'center', 'right'."
+                                ),
+                            ),
+                            "who": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description=(
+                                    "Optional semantic hint: 'me' (the "
+                                    "current speaker), 'other' (the "
+                                    "non-speaking person - typical for "
+                                    "introductions), 'pointed' (the "
+                                    "person the user is pointing at)."
                                 ),
                             ),
                         },
@@ -364,6 +410,172 @@ def build_face_tools() -> list:
     ]
 
 
+def _resolve_enroll_target(
+    recognizer: FaceRecognizer,
+    lip_tracker: Optional[LipMotionTracker],
+    gesture_tracker: "Optional[GestureTracker]",
+    get_frame: Any,
+    position_hint: Optional[str],
+    who_hint: Optional[str],
+) -> Dict[str, Any]:
+    """Choose which visible face to enroll.
+
+    Priority (highest wins):
+
+    1. Explicit ``position`` hint from Gemini - pick the single face
+       at that side of the frame.
+    2. ``who='pointed'`` OR a fresh PointHint visible in the scene -
+       pick the face inside the pointed-at body bbox.
+    3. ``who='other'`` (the introducee / non-speaker) when the
+       current speaker is identifiable via lip-motion - pick the
+       non-speaking face.
+    4. Exactly one unknown face visible - pick it. This is the most
+       common "this is my friend Ahmad" case.
+    5. Only one face visible at all - pick it (old behaviour).
+    6. Otherwise return ``reason='ambiguous'`` with a candidates
+       list so Gemini can ask the user to clarify.
+
+    Returns a dict with either ``ok=True`` plus the target bbox +
+    human-readable reason, or ``ok=False`` with a reason and
+    candidates so the caller can relay to Gemini.
+    """
+    frame = get_frame()
+    if frame is None:
+        return {"ok": False, "reason": "no_frame"}
+    matches = recognizer.identify_all_in_frame(frame)
+    if not matches:
+        return {"ok": False, "reason": "no_face_visible"}
+
+    candidates = [
+        {
+            "position": m.position,
+            "name": m.name or "unknown",
+            "bbox": list(m.bbox),
+        }
+        for m in matches
+    ]
+
+    # ---- 1. Position hint ---------------------------------------------
+    if position_hint in ("left", "center", "right"):
+        picks = [m for m in matches if m.position == position_hint]
+        if len(picks) == 1:
+            p = picks[0]
+            return {
+                "ok": True, "bbox": list(p.bbox),
+                "position": p.position,
+                "reason": f"position={position_hint}",
+            }
+        if not picks:
+            return {
+                "ok": False, "reason": "position_empty",
+                "position": position_hint, "candidates": candidates,
+            }
+        # Multiple faces at that side -- still ambiguous; fall through.
+
+    # ---- 2. Pointing ---------------------------------------------------
+    point_hint = None
+    if gesture_tracker is not None:
+        point_hint = gesture_tracker.get_point_hint(max_age_s=2.0)
+    want_pointed = (who_hint == "pointed") or (
+        who_hint is None and point_hint is not None
+        and point_hint.pointed_at_bbox is not None
+    )
+    if want_pointed:
+        if point_hint is None or point_hint.pointed_at_bbox is None:
+            if who_hint == "pointed":
+                return {
+                    "ok": False, "reason": "no_pointing_detected",
+                    "candidates": candidates,
+                }
+        else:
+            body_bbox = point_hint.pointed_at_bbox
+            # Pick the face whose bbox is best contained inside the
+            # pointed-at body bbox.
+            best = None
+            best_score = 0.0
+            for m in matches:
+                s = _bbox_containment(m.bbox, body_bbox)
+                if s > best_score:
+                    best_score = s
+                    best = m
+            if best is not None and best_score >= 0.5:
+                return {
+                    "ok": True, "bbox": list(best.bbox),
+                    "position": best.position, "reason": "pointing",
+                }
+
+    # ---- 3. "other" / non-speaker --------------------------------------
+    if who_hint == "other" and lip_tracker is not None:
+        speech_snap = lip_tracker.snapshot()
+        speaking_bboxes = [
+            tuple(s.bbox) for s in speech_snap if s.is_speaking
+        ]
+        if speaking_bboxes:
+            non_speakers = [
+                m for m in matches
+                if not any(
+                    _bbox_iou_simple(m.bbox, sb) > 0.3 for sb in speaking_bboxes
+                )
+            ]
+            if len(non_speakers) == 1:
+                p = non_speakers[0]
+                return {
+                    "ok": True, "bbox": list(p.bbox),
+                    "position": p.position, "reason": "non_speaker",
+                }
+
+    # ---- 4. Unknown-only -----------------------------------------------
+    unknown = [m for m in matches if m.name is None]
+    if len(unknown) == 1:
+        p = unknown[0]
+        return {
+            "ok": True, "bbox": list(p.bbox),
+            "position": p.position, "reason": "only_unknown",
+        }
+
+    # ---- 5. Single face ------------------------------------------------
+    if len(matches) == 1:
+        p = matches[0]
+        return {
+            "ok": True, "bbox": list(p.bbox),
+            "position": p.position, "reason": "only_face",
+        }
+
+    # ---- 6. Ambiguous --------------------------------------------------
+    return {
+        "ok": False, "reason": "ambiguous",
+        "candidates": candidates,
+    }
+
+
+def _bbox_containment(inner, outer) -> float:
+    """Fraction of ``inner`` bbox that falls inside ``outer`` bbox."""
+    ix1, iy1, ix2, iy2 = inner
+    ox1, oy1, ox2, oy2 = outer
+    ax1, ay1 = max(ix1, ox1), max(iy1, oy1)
+    ax2, ay2 = min(ix2, ox2), min(iy2, oy2)
+    if ax2 <= ax1 or ay2 <= ay1:
+        return 0.0
+    inter = (ax2 - ax1) * (ay2 - ay1)
+    inner_area = max(1, (ix2 - ix1) * (iy2 - iy1))
+    return inter / inner_area
+
+
+def _bbox_iou_simple(a, b) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    a_area = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    b_area = max(0, bx2 - bx1) * max(0, by2 - by1)
+    return inter / max(1, a_area + b_area - inter)
+
+
 def make_tool_handler(
     recognizer: FaceRecognizer,
     latest: "LatestFrame",
@@ -372,6 +584,7 @@ def make_tool_handler(
     cascade_tracker: Optional[CascadeTracker] = None,
     world: Optional[WorldStateHolder] = None,
     identity_graph: Optional[IdentityGraph] = None,
+    gesture_tracker: "Optional[GestureTracker]" = None,
 ):
     """Build the async tool handler closure Gemini Live will call."""
 
@@ -380,16 +593,35 @@ def make_tool_handler(
             person = str(args.get("name", "")).strip()
             if not person:
                 return {"ok": False, "error": "name is required"}
-            # Long-running: offload to a thread so we don't block the
-            # Gemini event loop.
+            position_hint = (args.get("position") or "").strip().lower() or None
+            who_hint = (args.get("who") or "").strip().lower() or None
+
+            # Resolve WHICH face to enroll from the current frame.
+            pick = await asyncio.to_thread(
+                _resolve_enroll_target,
+                recognizer,
+                lip_tracker,
+                gesture_tracker,
+                latest.get_frame,
+                position_hint,
+                who_hint,
+            )
+            if not pick.get("ok"):
+                return pick
+
+            target_bbox = tuple(pick["bbox"])
             count = await asyncio.to_thread(
-                recognizer.enroll, person, latest.get_frame,
+                recognizer.enroll,
+                person,
+                latest.get_frame,
+                target_bbox=target_bbox,
             )
             if count == 0:
                 return {
                     "ok": False,
                     "name": person,
-                    "reason": "no_face_visible",
+                    "reason": "target_lost",
+                    "picked": pick.get("reason"),
                 }
             # Mirror into the identity graph so voice enrollment
             # can link to the same person later.
@@ -398,7 +630,13 @@ def make_tool_handler(
                     identity_graph.record_face_enrollment(person, count)
                 except Exception as e:  # pragma: no cover
                     log.warning("identity_graph enrollment hook failed: %s", e)
-            return {"ok": True, "name": person, "samples_captured": count}
+            return {
+                "ok": True,
+                "name": person,
+                "samples_captured": count,
+                "picked": pick.get("reason"),
+                "position": pick.get("position"),
+            }
 
         if name == "identify_person":
             matches = await asyncio.to_thread(
@@ -480,26 +718,34 @@ def make_tool_handler(
                     "name": person,
                     "known_names": recognizer.db.list_names(),
                 }
-            # Fresh recognition + YOLO track match so focus engages now
-            # rather than waiting for the next lip-tracker tick.
+            # Always ARM the mode -- even if the person isn't visible
+            # yet. The GazePolicy silently falls through to normal
+            # scoring while the target is offscreen; the instant they
+            # step into frame the lock engages automatically. This
+            # matches "when Husam walks in, look at him" semantics.
+            focus_manager.set_mode_person(canonical)
+
+            # Opportunistic: if they ARE visible right now, engage
+            # immediately instead of waiting for the next lip-tracker
+            # tick.
             matches = await asyncio.to_thread(
                 recognizer.identify_all, latest.get_frame,
             )
             face = next((m for m in matches if m.name == canonical), None)
-            if face is None:
-                return {
-                    "ok": False,
-                    "reason": "not_visible",
-                    "name": canonical,
-                }
-            yolo_tracks = cascade_tracker.get_all_tracks()
-            yolo_id = focus_manager.try_focus_by_face_match(face, yolo_tracks)
-            focus_manager.set_mode_person(canonical)
+            yolo_id: Optional[int] = None
+            position: Optional[str] = None
+            if face is not None:
+                yolo_tracks = cascade_tracker.get_all_tracks()
+                yolo_id = focus_manager.try_focus_by_face_match(
+                    face, yolo_tracks,
+                )
+                position = face.position
             return {
                 "ok": True,
                 "mode": "person",
                 "name": canonical,
-                "position": face.position,
+                "visible_now": face is not None,
+                "position": position,
                 "yolo_track_id": yolo_id,
                 "engaged_now": yolo_id is not None,
             }
@@ -571,6 +817,17 @@ def make_tool_handler(
                 },
                 "env": {
                     "audio_speech_active": snap.env.audio_speech_active,
+                    "last_heard_voice_name": snap.env.last_heard_voice_name,
+                    "last_heard_voice_similarity": round(
+                        snap.env.last_heard_voice_similarity, 3,
+                    ),
+                    "last_heard_voice_age_s": (
+                        None
+                        if snap.env.last_heard_voice_ts == 0.0
+                        else round(
+                            time.monotonic() - snap.env.last_heard_voice_ts, 2,
+                        )
+                    ),
                 },
             }
 
@@ -849,6 +1106,10 @@ def main() -> None:
     parser.add_argument("--no-identity-graph", action="store_true",
                         help="Disable the IdentityGraph layer on top of "
                              "FaceDB (voice enrollment + corrections).")
+    parser.add_argument("--no-voice-id", action="store_true",
+                        help="Disable speaker identification + "
+                             "cross-modal voice/face linking "
+                             "(SpeechBrain ECAPA-TDNN).")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -921,6 +1182,8 @@ def main() -> None:
     audio_vad: Optional[SileroVAD] = None
     head_pose_tracker: Optional[HeadPoseTracker] = None
     gesture_tracker: Optional[GestureTracker] = None
+    voice_embedder: Optional[VoiceEmbedder] = None
+    voice_identity: Optional[VoiceIdentityWorker] = None
 
     # --- Camera (direct OpenCV, coexists with daemon on macOS) ---------
     cap = open_camera(args.camera)
@@ -1011,6 +1274,47 @@ def main() -> None:
         )
         gesture_tracker.start()
 
+    # --- Voice identity (speaker ID + cross-modal enrollment) ---------
+    # Requires: VAD (utterance source), face_recognizer (who is
+    # visibly speaking right now) and an identity graph. Any missing
+    # piece disables the whole stack. See docs/identity.md §3 for
+    # the co-occurrence enrollment algorithm.
+    if (
+        audio_vad is not None
+        and identity_graph is not None
+        and lip_tracker is not None
+        and not args.no_voice_id
+    ):
+        voice_embedder = VoiceEmbedder()
+
+        def _visible_speaker() -> Optional[str]:
+            """Return the canonical name of a visible + currently-speaking face.
+
+            Exactly one named face must be speaking; otherwise the
+            enrollment attribution is ambiguous and we return None so
+            the sample gets skipped.
+            """
+            try:
+                names_speaking = [
+                    s.name for s in lip_tracker.snapshot()
+                    if s.is_speaking and s.name
+                ]
+            except Exception:
+                return None
+            if len(names_speaking) != 1:
+                return None
+            return names_speaking[0]
+
+        voice_identity = VoiceIdentityWorker(
+            vad=audio_vad,
+            embedder=voice_embedder,
+            identity_graph=identity_graph,
+            world=world,
+            bus=bus,
+            visible_speaker_supplier=_visible_speaker,
+        )
+        voice_identity.start()
+
     # --- Reactive wiring: person_lost -> directed head search ---------
     # The gaze-motion planner (natural_gaze.py) handles the visual
     # "where did they go?" sweep when it gets a notify_person_lost()
@@ -1096,6 +1400,7 @@ def main() -> None:
                             focus_manager, tracker,
                             world=world,
                             identity_graph=identity_graph,
+                            gesture_tracker=gesture_tracker,
                         )
                     model = args.model or os.environ.get("GEMINI_MODEL")
                     if model:
@@ -1132,6 +1437,23 @@ def main() -> None:
                 except Exception as e:  # pragma: no cover
                     log.debug("voice_unseen hook failed: %s", e)
             bus.subscribe(EVT_VOICE_UNSEEN, _on_voice_unseen)
+
+            # Hook bus -> "who said that?" search when we recognise a
+            # voice but the corresponding face isn't in frame. This is
+            # what lets the robot turn to look for Husam when it hears
+            # him from around a corner.
+            def _on_voice_identified(evt):
+                name = evt.payload.get("name")
+                if not name:
+                    return
+                try:
+                    snap = world.snapshot()
+                    if snap.find_by_name(name) is not None:
+                        return   # they are already visible, nothing to do
+                    controller.notify_voice_unseen()
+                except Exception as e:   # pragma: no cover
+                    log.debug("voice_identified hook failed: %s", e)
+            bus.subscribe(EVT_VOICE_IDENTIFIED, _on_voice_identified)
 
             # Track the currently focused *name* so we only announce
             # real person-to-person changes to the gaze planner. Raw
@@ -1217,10 +1539,18 @@ def main() -> None:
                     mode = "TALK" if snap.talking else "idle"
                     focus_tag = ""
                     if focus_snap is not None and focus_snap.mode != "auto":
-                        focus_tag = (
-                            f" focus={focus_snap.mode}"
-                            f"({focus_snap.focused_name or '?'})"
-                        )
+                        # In person(name) mode, target_name is the name
+                        # we were ASKED to follow; focused_name is who
+                        # the policy actually picked this tick (may
+                        # differ if target is offscreen or face
+                        # recognition flipped).
+                        tgt = focus_snap.target_name
+                        got = focus_snap.focused_name
+                        if tgt and got and tgt != got:
+                            label = f"{tgt}->{got}"
+                        else:
+                            label = tgt or got or "?"
+                        focus_tag = f" focus={focus_snap.mode}({label})"
                     log.info(
                         "tier=%-9s %-4s %-4s err=(%+.2f,%+.2f) "
                         "yaw=%+6.1f pitch=%+6.1f body=%+6.1f%s",
@@ -1251,6 +1581,8 @@ def main() -> None:
             head_pose_tracker.stop(timeout=1.0)
         if gesture_tracker is not None:
             gesture_tracker.stop(timeout=1.0)
+        if voice_identity is not None:
+            voice_identity.stop(timeout=1.0)
         if audio_vad is not None:
             audio_vad.stop(timeout=1.0)
         if lip_tracker is not None and lip_tracker.is_alive():

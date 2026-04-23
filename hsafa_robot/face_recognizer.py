@@ -387,6 +387,8 @@ class FaceRecognizer:
         *,
         num_samples: int = DEFAULT_NUM_SAMPLES,
         timeout_s: float = DEFAULT_ENROLL_TIMEOUT_S,
+        target_bbox: Optional[Tuple[int, int, int, int]] = None,
+        bbox_iou_min: float = 0.35,
     ) -> int:
         """Capture ~``num_samples`` embeddings and save them under ``name``.
 
@@ -394,6 +396,13 @@ class FaceRecognizer:
         collected OR ``timeout_s`` seconds elapse. Returns the number of
         *new* embeddings actually saved (0 means enrollment failed --
         e.g. no face was visible).
+
+        When ``target_bbox`` is provided, only faces that overlap it
+        by at least ``bbox_iou_min`` are embedded. This is how the
+        enrollment disambiguator ("enroll Ahmad, the person the user
+        is pointing at") locks onto a specific visible face instead
+        of defaulting to the largest one -- see
+        :func:`main._pick_enroll_target`.
         """
         canonical = canonicalize_name(name)
         if not canonical:
@@ -422,14 +431,30 @@ class FaceRecognizer:
                 time.sleep(0.05)
                 continue
 
-            # Enroll the LARGEST face in frame. When a user says "I am X"
-            # they are almost always the closest / most prominent face;
-            # picking by bbox area protects us from accidentally learning
-            # a bystander's face in the background.
-            def _area(d):
-                x1, y1, x2, y2 = d[1]
-                return max(0, x2 - x1) * max(0, y2 - y1)
-            emb, bbox, _prob = max(detections, key=_area)
+            # Subject selection.
+            if target_bbox is not None:
+                # Pick the face that best overlaps the target bbox. We
+                # use IoU so a big detection and a small detection are
+                # compared fairly.
+                def _iou_to_target(d):
+                    return _bbox_iou(d[1], target_bbox)
+                best = max(detections, key=_iou_to_target)
+                if _iou_to_target(best) < bbox_iou_min:
+                    # The targeted person may have stepped out of
+                    # frame; skip this tick rather than enrolling the
+                    # wrong person.
+                    time.sleep(0.05)
+                    continue
+                emb, bbox, _prob = best
+            else:
+                # Enroll the LARGEST face in frame. When a user says "I am X"
+                # they are almost always the closest / most prominent face;
+                # picking by bbox area protects us from accidentally learning
+                # a bystander's face in the background.
+                def _area(d):
+                    x1, y1, x2, y2 = d[1]
+                    return max(0, x2 - x1) * max(0, y2 - y1)
+                emb, bbox, _prob = max(detections, key=_area)
 
             collected.append(emb)
             last_accepted_ts = time.time()
@@ -448,3 +473,23 @@ class FaceRecognizer:
             canonical, len(collected), total,
         )
         return len(collected)
+
+
+def _bbox_iou(
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+) -> float:
+    """Intersection-over-union of two axis-aligned bboxes."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0:
+        return 0.0
+    a_area = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    b_area = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = a_area + b_area - inter
+    return inter / max(1, union)

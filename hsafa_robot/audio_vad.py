@@ -29,7 +29,8 @@ import logging
 import threading
 import time
 from collections import deque
-from typing import Deque, Optional
+from dataclasses import dataclass
+from typing import Callable, Deque, List, Optional
 
 import numpy as np
 
@@ -59,6 +60,36 @@ DEACTIVATE_CHUNKS = 10    # ~320 ms of silence before we say "quiet"
 # producing many false positives in quiet rooms.
 SPEECH_THRESHOLD = 0.5
 
+# Utterance capture bounds. Too-short clips don't give the voice
+# embedder enough context; too-long ones risk bleeding two speakers
+# into one embedding. Targets roughly match how SpeechBrain's
+# ECAPA-TDNN recipe was trained.
+UTTERANCE_MIN_S = 0.6        # below this we throw the utterance away
+UTTERANCE_MAX_S = 6.0        # above this we chunk mid-stream
+
+
+@dataclass
+class Utterance:
+    """One completed speech segment ready for speaker embedding.
+
+    ``samples`` is 16 kHz mono float32 in [-1, 1]. ``start_ts`` /
+    ``end_ts`` are :func:`time.monotonic` timestamps (close to when
+    the waveform arrived on the mic, not when it was finally flushed).
+    """
+    samples: np.ndarray
+    start_ts: float
+    end_ts: float
+
+    @property
+    def duration_s(self) -> float:
+        return self.samples.shape[0] / float(SILERO_SAMPLE_RATE)
+
+
+# Utterance callbacks are synchronous from the worker thread.
+# Subscribers must not block: off-load embedding work to another
+# thread themselves if needed.
+UtteranceCallback = Callable[[Utterance], None]
+
 
 class SileroVAD:
     """Streaming Silero-VAD wrapper running on its own worker thread.
@@ -66,6 +97,12 @@ class SileroVAD:
     Thread-safe: :meth:`push_samples` can be called from any thread
     (typically the mic callback). The inference worker pulls from an
     internal deque under a lock.
+
+    Utterance capture: the VAD also buffers the raw waveform between
+    rising- and falling-edge transitions. When an utterance completes
+    (or gets too long and is chunked), every subscriber registered
+    via :meth:`add_utterance_callback` receives the full waveform.
+    This is the entry point for downstream speaker embedding.
     """
 
     def __init__(
@@ -97,6 +134,13 @@ class SileroVAD:
         self._model_state = None # h0/c0 for stateful inference
         self.enabled = False
 
+        # Utterance capture state. Lives in the worker thread (no
+        # locking needed; callbacks are the only external hand-off).
+        self._utt_chunks: List[np.ndarray] = []
+        self._utt_start_ts: float = 0.0
+        self._utt_callbacks: List[UtteranceCallback] = []
+        self._cb_lock = threading.Lock()
+
     # ---- public read-only status ------------------------------------
     @property
     def is_active(self) -> bool:
@@ -105,6 +149,19 @@ class SileroVAD:
     @property
     def last_prob(self) -> float:
         return self._last_prob
+
+    # ---- utterance subscription -------------------------------------
+    def add_utterance_callback(self, cb: UtteranceCallback) -> None:
+        """Subscribe to completed utterances. Called from VAD worker thread."""
+        with self._cb_lock:
+            self._utt_callbacks.append(cb)
+
+    def remove_utterance_callback(self, cb: UtteranceCallback) -> None:
+        with self._cb_lock:
+            try:
+                self._utt_callbacks.remove(cb)
+            except ValueError:
+                pass
 
     # ---- lifecycle --------------------------------------------------
     def start(self) -> None:
@@ -192,6 +249,8 @@ class SileroVAD:
         if not self._load_model():
             return
         torch = self._torch
+        max_samples = int(UTTERANCE_MAX_S * SILERO_SAMPLE_RATE)
+
         while not self._stop.is_set():
             chunk = self._pop_chunk()
             if chunk is None:
@@ -207,6 +266,18 @@ class SileroVAD:
                 continue
 
             self._last_prob = prob
+            # Utterance buffering: every chunk emitted *while* active
+            # gets appended to the current utterance, including the
+            # first few that triggered the rising edge.
+            if self._is_active or prob >= self._threshold:
+                if not self._utt_chunks:
+                    self._utt_start_ts = time.monotonic()
+                self._utt_chunks.append(chunk.copy())
+                # Chunk very long utterances so one monologue doesn't
+                # block voice embedding updates.
+                if sum(c.shape[0] for c in self._utt_chunks) >= max_samples:
+                    self._flush_utterance()
+
             if prob >= self._threshold:
                 self._run_active += 1
                 self._run_quiet = 0
@@ -216,7 +287,34 @@ class SileroVAD:
                 self._run_quiet += 1
                 self._run_active = 0
                 if self._is_active and self._run_quiet >= DEACTIVATE_CHUNKS:
+                    # Falling edge -> close the utterance.
+                    self._flush_utterance()
                     self._set_active(False)
+
+        # On shutdown, drop any pending partial utterance.
+        self._utt_chunks.clear()
+
+    def _flush_utterance(self) -> None:
+        """Concatenate the active chunks and ship them to subscribers."""
+        if not self._utt_chunks:
+            return
+        samples = np.concatenate(self._utt_chunks, axis=0)
+        self._utt_chunks.clear()
+        duration = samples.shape[0] / float(SILERO_SAMPLE_RATE)
+        if duration < UTTERANCE_MIN_S:
+            return
+        utt = Utterance(
+            samples=samples,
+            start_ts=self._utt_start_ts,
+            end_ts=time.monotonic(),
+        )
+        with self._cb_lock:
+            subs = list(self._utt_callbacks)
+        for cb in subs:
+            try:
+                cb(utt)
+            except Exception as e:   # pragma: no cover - defensive
+                log.warning("SileroVAD utterance callback raised: %s", e)
 
     def _set_active(self, active: bool) -> None:
         if active == self._is_active:

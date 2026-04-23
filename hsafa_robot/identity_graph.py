@@ -36,7 +36,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -339,6 +339,49 @@ class IdentityGraph:
                 identity_id=ident.id, ts=time.time(), voice_embedding=emb,
             ))
             return len(bucket)
+
+    def identify_voice(
+        self,
+        embedding: np.ndarray,
+        *,
+        threshold: float = 0.70,
+    ) -> Optional[Tuple[str, float]]:
+        """Return ``(name, similarity)`` for the best-matching voice bank.
+
+        Compares ``embedding`` (assumed L2-normalized) against every
+        ``voices/<name>.npy`` using cosine similarity -- implemented
+        as a simple dot product, mirroring :class:`FaceDB`. Only
+        matches scoring at or above ``threshold`` are returned.
+
+        Thread-safe: we cache an in-memory bank and hot-reload it
+        when the matching ``.npy`` on disk grows.
+        """
+        emb = np.ascontiguousarray(embedding, dtype=np.float32)
+        n = float(np.linalg.norm(emb))
+        if n <= 1e-8:
+            return None
+        emb = (emb / n).astype(np.float32)
+
+        best_name: Optional[str] = None
+        best_sim: float = -1.0
+        with self._lock:
+            for path in sorted(self._voices_dir.glob("*.npy")):
+                try:
+                    bank = np.load(path)
+                except Exception as e:
+                    log.warning("identify_voice: could not load %s: %s", path, e)
+                    continue
+                if bank.ndim != 2 or bank.shape[1] != emb.shape[0]:
+                    continue
+                # Each row is already L2-normalized at stash time.
+                sims = bank @ emb
+                sim = float(sims.max())
+                if sim > best_sim:
+                    best_sim = sim
+                    best_name = path.stem
+        if best_name is None or best_sim < threshold:
+            return None
+        return best_name, best_sim
 
     def commit_pending_voices(self, min_samples: int = 5) -> List[str]:
         """Flush buckets with enough samples to disk. Returns committed names."""

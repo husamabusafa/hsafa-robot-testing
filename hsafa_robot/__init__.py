@@ -4,12 +4,13 @@ Layer map (see docs/architecture.md):
 
 L0  I/O        : reachy_mini (external), OpenCV, GStreamer (via MediaManager)
 L1  Perception : tracker, face_recognizer, lip_motion, audio_vad,
-                 head_pose, gestures
+                 head_pose, gestures, voice_embedder
 L2  Cognition  : events (EventBus), world_state (WorldStateHolder),
                  perception (WorldState builder), gaze_policy
                  (scoring engine), focus (FocusManager driver),
                  natural_gaze (saccades / idle drift / search),
-                 identity_graph (face+voice+name link)
+                 identity_graph (face+voice+name link),
+                 voice_identity (speaker ID + cross-modal enrollment)
 L3  Voice      : gemini_live
 L4  Thinker    : (reserved for future Hsafa Core bridge)
 
@@ -27,6 +28,7 @@ __all__ = [
     "audio_vad",
     "head_pose",
     "gestures",
+    "voice_embedder",
     # L2 cognition
     "events",
     "world_state",
@@ -35,6 +37,7 @@ __all__ = [
     "focus",
     "natural_gaze",
     "identity_graph",
+    "voice_identity",
     # L3 voice
     "gemini_live",
     # L0 motion

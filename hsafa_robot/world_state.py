@@ -131,6 +131,11 @@ class EnvView:
     doa_azimuth_deg: Optional[float] = None   # sound direction (2+ mics)
     noise_level: float = 0.0            # linear RMS of room audio
     lighting: str = "normal"
+    # Most recent voice-identification result; ``None`` means either
+    # no one has spoken yet or the last speaker wasn't recognized.
+    last_heard_voice_name: Optional[str] = None
+    last_heard_voice_similarity: float = 0.0
+    last_heard_voice_ts: float = 0.0
 
 
 # ---- The whole state ------------------------------------------------------
@@ -306,6 +311,21 @@ class WorldStateHolder:
         with self._lock:
             self._state.env.audio_speech_active = bool(active)
             self._state.last_update = time.monotonic()
+
+    def set_last_heard_voice(
+        self,
+        name: Optional[str],
+        similarity: float,
+        *,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record the most recent speaker-ID result on ``EnvView``."""
+        now = now if now is not None else time.monotonic()
+        with self._lock:
+            self._state.env.last_heard_voice_name = name
+            self._state.env.last_heard_voice_similarity = float(similarity)
+            self._state.env.last_heard_voice_ts = now
+            self._state.last_update = now
 
     def set_robot_target(
         self,

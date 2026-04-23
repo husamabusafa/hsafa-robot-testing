@@ -51,6 +51,8 @@ EVT_AUDIO_SPEECH_ACTIVE = "audio_speech_active"   # bool, from VAD
 EVT_SPEECH_HEARD = "speech_heard"                 # finalized utterance text
 EVT_USER_SAID = "user_said"                       # from Gemini turn boundary
 EVT_ROBOT_SAID = "robot_said"                     # from Gemini turn boundary
+EVT_VOICE_IDENTIFIED = "voice_identified"         # speaker-id from ECAPA utterance
+EVT_VOICE_ENROLLED = "voice_enrolled"             # cross-modal co-occurrence commit
 
 # Focus / gaze
 EVT_GAZE_TARGET_CHANGED = "gaze_target_changed"

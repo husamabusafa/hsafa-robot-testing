@@ -12,3 +12,8 @@ Pillow>=10.0
 mediapipe>=0.10
 # Silero VAD: gates lip-motion on real speech (no chewing false-fires).
 silero-vad>=5.0
+# SpeechBrain + torchaudio: ECAPA-TDNN speaker embeddings for voice
+# recognition + automatic voice/face linking. Disable with
+# --no-voice-id if the download is an issue.
+speechbrain>=1.0
+torchaudio>=2.0
