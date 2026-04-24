@@ -1,44 +1,19 @@
 """
-Reachy Mini head follow — SAM 3.1 native + latency-aware world-frame control
-================================================================================
+Reachy Mini head follow — SAM 3.1 + KLT tracker + direct angle mapping
+======================================================================
 
-WHY THIS VERSION (vs the previous one)
----------------------------------------
+Simple, snappy head tracking.  No latency compensation, no world-frame
+history, no velocity predictor.
 
-The previous version had a positive feedback loop:
+How it works
+------------
+1. SAM detects the object (~2 Hz).
+2. We seed KLT feature points inside the SAM bbox.
+3. Every camera frame (~30 Hz) optical flow tracks those points.
+4. Median of tracked points = object centre, updated in real time.
+5. Direct pixel error → head angle command, sent immediately.
 
-    head moves up → SAM is 400ms behind → SAM still sees face "up" →
-    controller moves head further up → SAM still says "up" → ...
-
-The fix has three pieces:
-
-1. SAM stamps each bbox with WHEN the camera grabbed the frame it
-   processed (capture_ts).
-2. The controller keeps a short history of head angles vs time.
-3. When SAM returns, the controller uses the head angle that was
-   commanded AT THE CAPTURE TIME, not the current angle. The world-
-   frame target then stays stable across SAM's latency window.
-
-Plus: critical damping (CONTROL_GAIN = 0.35). Don't correct 100% of
-the error in one tick — correct only a fraction. Multiple SAM samples
-will refine the target. This single change kills overshoot even if
-everything else is wrong.
-
-This is the standard solution for visual servoing with latent perception.
-
-USAGE
------
-
-    python reachy_head_follow.py --concept person       # real robot
-    python reachy_head_follow.py --no-reachy            # dry run
-    python reachy_head_follow.py --sim                  # simulated daemon
-
-KEY KNOBS (top of file)
------------------------
-
-    HORIZONTAL_FOV_DEG  must match your camera. Procedure in comment.
-    CONTROL_GAIN        lower if head still oscillates. Default 0.35.
-    DEADZONE_RAD        ignore errors below this. Default 2°.
+The red dot on screen moves every frame.  The head follows it instantly.
 """
 
 from __future__ import annotations
@@ -91,46 +66,20 @@ PITCH_SIGN = +1.0
 YAW_LIMIT_RAD = math.radians(60)
 PITCH_LIMIT_RAD = math.radians(30)
 
-# CONTROL_GAIN: fraction of the *measured world-frame error* we correct
-# per SAM update. With SAM at 2.5 Hz and the head moving smoothly, ~0.35
-# means it takes ~3 SAM samples to converge — plenty of time for the
-# next SAM sample to confirm the correction worked. Lower = more
-# resistant to overshoot, higher = snappier. IF YOU SEE OSCILLATION,
-# DROP THIS FIRST. Try 0.2.
-# Raised from 0.35 because SAM is running ~0.2 Hz, not 2.5 Hz — each
-# sample has to do more work or the head never catches up.
-CONTROL_GAIN = 0.6
+# Direct-follow gain: fraction of the error corrected each tick.
+# 0.6 = snappy but stable.  If it still overshoots, lower to 0.4.
+GAIN = 0.6
 
-# Don't chase errors smaller than this — prevents micro-jitter.
-DEADZONE_RAD = math.radians(2.0)
-
-# When no target, decay world target back to neutral. Slow on purpose.
-RECENTER_DECAY_PER_TICK = 0.97
+# Camera-motion damping: subtracts a fraction of the camera's own
+# rotation rate from the command, acting as a brake when the head
+# is already turning fast.  Prevents overshoot without adding lag.
+DAMP = 0.25
 
 # Trust window for the last SAM bbox.
 COAST_S = 1.0
 
 # Control loop rate.
 TICK_MS = 33
-
-# Head-angle history retention (seconds).
-HEAD_HISTORY_S = 8.0
-
-# Command smoothing (30 Hz loop, sparse SAM updates).
-# Without smoothing, _cmd snaps to _target the moment SAM produces a
-# new sample, then holds still for 5 s — visibly blocky. Instead we
-# ease toward the target every tick and cap the per-tick step so
-# large jumps turn into a smooth ramp.
-CMD_SMOOTH_ALPHA = 0.22      # ease-in to predicted target each tick
-MAX_YAW_RATE_DPS = 160.0     # deg/s — generous cap; predictor does real work
-MAX_PITCH_RATE_DPS = 100.0   # deg/s
-
-# Predictive tracking: since SAM is ~0.2 Hz, we extrapolate target motion
-# between detections using a simple linear-velocity model.  The head
-# never sits still waiting for the next SAM frame.
-PREDICTOR_MAX_AGE_S = 5.0    # trust prediction up to this long after last SAM
-PREDICTOR_BLEND_S = 0.3      # seconds over which a new SAM sample eases in
-PREDICTOR_MIN_DELTA_S = 0.05 # ignore samples closer than this (avoid div-by-zero)
 
 
 # ---------------------------------------------------------------------------
@@ -463,18 +412,146 @@ class Sam3Follower:
 
 
 # ---------------------------------------------------------------------------
-# HeadFollower — latency-aware world-frame controller.
-#
-# THE CRITICAL CHANGE FROM THE PREVIOUS VERSION:
-#
-# We keep a deque of (timestamp, yaw, pitch) showing where the head was
-# commanded over the last 2 seconds. When SAM returns a bbox stamped
-# with capture_ts, we look up the head angle that was COMMANDED AT
-# capture_ts — not what the head is doing right now.
-#
-# This breaks the positive feedback loop. The world-frame target now
-# reflects "where the face was, given where the head was looking when
-# we took the picture", which stays stable as the head turns.
+# KLT tracker — tracks object features inside the SAM bbox at camera rate.
+# ---------------------------------------------------------------------------
+class KltTracker:
+    """Track an object region with KLT optical flow.
+
+    When SAM gives a bbox we seed features inside it.
+    Every camera frame we forward-track those features.
+    Median of tracked feature positions = object centre.
+    This runs at ~30 Hz (1-2 ms/frame), much faster than SAM.
+    """
+
+    def __init__(self):
+        self.prev_gray: Optional[np.ndarray] = None
+        self.prev_kp: Optional[np.ndarray] = None
+        self.cx: float = 0.0
+        self.cy: float = 0.0
+        self.lost: bool = True
+
+    def reset(self) -> None:
+        self.prev_gray = None
+        self.prev_kp = None
+        self.cx = 0.0
+        self.cy = 0.0
+        self.lost = True
+
+    def init(self, gray: np.ndarray, bbox: BBox) -> None:
+        x1, y1, x2, y2 = bbox
+        margin = 4
+        roi = gray[y1 + margin:y2 - margin, x1 + margin:x2 - margin]
+        if roi.size == 0:
+            self.lost = True
+            return
+        kp = cv2.goodFeaturesToTrack(roi, maxCorners=60, qualityLevel=0.01, minDistance=5)
+        if kp is not None and len(kp) >= 5:
+            kp[:, 0, 0] += x1 + margin
+            kp[:, 0, 1] += y1 + margin
+            self.prev_kp = kp
+        self.cx = float((x1 + x2) / 2)
+        self.cy = float((y1 + y2) / 2)
+        self.prev_gray = gray.copy()
+        self.lost = False
+
+    def update(self, gray: np.ndarray) -> tuple[float, float, bool]:
+        """Return (cx, cy, is_lost)."""
+        if self.lost or self.prev_gray is None or self.prev_kp is None:
+            return self.cx, self.cy, True
+
+        next_kp, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, self.prev_kp, None,
+            winSize=(21, 21), maxLevel=3
+        )
+        if next_kp is None:
+            return self.cx, self.cy, True
+
+        mask = status.reshape(-1) == 1
+        if mask.sum() < 5:
+            return self.cx, self.cy, True
+
+        good = next_kp[mask]
+        self.cx = float(np.median(good[:, 0, 0]))
+        self.cy = float(np.median(good[:, 0, 1]))
+
+        self.prev_gray = gray.copy()
+        self.prev_kp = good.reshape(-1, 1, 2)
+        self.lost = False
+        return self.cx, self.cy, False
+
+
+# ---------------------------------------------------------------------------
+# CameraMotion — tracks background features to estimate ego-motion.
+# ---------------------------------------------------------------------------
+class CameraMotion:
+    """Estimate camera image shift from background optical flow.
+
+    Tracks features OUTSIDE the object bbox so the object itself does
+    not contaminate the background motion estimate.  Returns median
+    displacement (dx, dy) in pixels.
+    """
+
+    def __init__(self):
+        self.prev_gray: Optional[np.ndarray] = None
+        self.prev_kp: Optional[np.ndarray] = None
+        self.dx: float = 0.0
+        self.dy: float = 0.0
+
+    def reset(self) -> None:
+        self.prev_gray = None
+        self.prev_kp = None
+        self.dx = 0.0
+        self.dy = 0.0
+
+    def _detect(self, gray: np.ndarray, bbox: Optional[BBox] = None) -> Optional[np.ndarray]:
+        mask = None
+        if bbox is not None:
+            mask = np.ones(gray.shape, dtype=np.uint8) * 255
+            x1, y1, x2, y2 = bbox
+            cv2.rectangle(mask, (int(x1), int(y1)), (int(x2), int(y2)), 0, -1)
+        return cv2.goodFeaturesToTrack(gray, maxCorners=100, qualityLevel=0.01, minDistance=10, mask=mask)
+
+    def update(self, gray: np.ndarray, bbox: Optional[BBox] = None) -> tuple[float, float]:
+        if self.prev_gray is None or self.prev_kp is None or len(self.prev_kp) < 10:
+            self.prev_gray = gray.copy()
+            self.prev_kp = self._detect(gray, bbox)
+            self.dx, self.dy = 0.0, 0.0
+            return self.dx, self.dy
+
+        next_kp, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray, gray, self.prev_kp, None,
+            winSize=(21, 21), maxLevel=3
+        )
+        if next_kp is None:
+            self.prev_gray = gray.copy()
+            self.prev_kp = self._detect(gray, bbox)
+            self.dx, self.dy = 0.0, 0.0
+            return self.dx, self.dy
+
+        mask = status.reshape(-1) == 1
+        good_old = self.prev_kp[mask]
+        good_new = next_kp[mask]
+
+        if len(good_new) < 5:
+            self.prev_gray = gray.copy()
+            self.prev_kp = self._detect(gray, bbox)
+            self.dx, self.dy = 0.0, 0.0
+            return self.dx, self.dy
+
+        self.dx = float(np.median(good_new[:, 0, 0] - good_old[:, 0, 0]))
+        self.dy = float(np.median(good_new[:, 0, 1] - good_old[:, 0, 1]))
+
+        self.prev_gray = gray.copy()
+        self.prev_kp = good_new.reshape(-1, 1, 2)
+        if len(self.prev_kp) < 20:
+            new_kp = self._detect(gray, bbox)
+            if new_kp is not None:
+                self.prev_kp = new_kp
+        return self.dx, self.dy
+
+
+# ---------------------------------------------------------------------------
+# Simple controller — direct pixel → angle, no world frame, no smoothing.
 # ---------------------------------------------------------------------------
 @dataclass
 class ControlSnap:
@@ -483,185 +560,74 @@ class ControlSnap:
     cmd_yaw: float
     cmd_pitch: float
     have_target: bool
-    sam_lag_ms: float    # how stale this SAM sample was when we got it
+    sam_lag_ms: float    # kept for UI compatibility (always 0.0 now)
 
 
-def _clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-class HeadFollower:
+class SimpleController:
     def __init__(self) -> None:
-        self._target_yaw_world = 0.0
-        self._target_pitch_world = 0.0
-        self._cmd_yaw = 0.0
-        self._cmd_pitch = 0.0
-        # Ring buffer of (ts, cmd_yaw, cmd_pitch). Used to look up "what
-        # were we commanding at time T?" so we pair past SAM bboxes with
-        # the head angles that produced them.
-        self._history: deque = deque(maxlen=int(HEAD_HISTORY_S / (TICK_MS / 1000)))
-        # Last SAM sample we already integrated. Prevents re-correcting
-        # the same error every tick at 30 Hz from a 2-3 Hz SAM.
-        self._last_consumed_capture_ts: float = 0.0
-
-        # Predictor: velocity estimate so we extrapolate between SAM frames.
-        self._vel_yaw = 0.0
-        self._vel_pitch = 0.0
-        self._last_sam_yaw = 0.0
-        self._last_sam_pitch = 0.0
-        self._last_sam_ts = 0.0
-        self._pred_valid = False
-        self._last_tick_ts = 0.0
+        self.tracker = KltTracker()
+        self.camera = CameraMotion()
+        self.have_target: bool = False
 
     def reset(self) -> None:
-        self._target_yaw_world = 0.0
-        self._target_pitch_world = 0.0
-        self._cmd_yaw = 0.0
-        self._cmd_pitch = 0.0
-        self._history.clear()
-        self._last_consumed_capture_ts = 0.0
-        self._vel_yaw = 0.0
-        self._vel_pitch = 0.0
-        self._last_sam_yaw = 0.0
-        self._last_sam_pitch = 0.0
-        self._last_sam_ts = 0.0
-        self._pred_valid = False
-        self._last_tick_ts = 0.0
-
-    def _record_history(self) -> None:
-        self._history.append((time.time(), self._cmd_yaw, self._cmd_pitch))
-
-    def _angle_at(self, ts: float) -> tuple[float, float]:
-        """Return (yaw, pitch) commanded closest to timestamp ts."""
-        if not self._history:
-            return (self._cmd_yaw, self._cmd_pitch)
-        best = self._history[0]
-        best_dt = abs(best[0] - ts)
-        for entry in self._history:
-            dt = abs(entry[0] - ts)
-            if dt < best_dt:
-                best = entry
-                best_dt = dt
-        return (best[1], best[2])
+        self.tracker.reset()
+        self.camera.reset()
+        self.have_target = False
 
     def step(
         self,
+        frame: np.ndarray,
         bbox: Optional[BBox],
         frame_hw: tuple[int, int],
         have_target: bool,
         capture_ts: float,
     ) -> ControlSnap:
-        """One control tick (called at TICK_MS rate from the camera loop).
-
-        Parameters
-        ----------
-        bbox        : latest bbox in pixel coords (camera frame)
-        frame_hw    : (H, W) of the camera frame
-        have_target : True iff bbox is recent and follower is TRACKING
-        capture_ts  : when the bbox's source frame was grabbed (epoch s)
-        """
         H, W = frame_hw
-        v_fov_rad = HORIZONTAL_FOV_RAD * (H / max(1, W))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        err_yaw_cam = 0.0
-        err_pitch_cam = 0.0
-        sam_lag_ms = 0.0
+        # Background motion — used as a brake term.
+        bg_dx, bg_dy = self.camera.update(gray, bbox if have_target else None)
+        v_fov = HORIZONTAL_FOV_RAD * (H / max(1, W))
+        cam_yaw = -(bg_dx / W) * HORIZONTAL_FOV_RAD
+        cam_pitch = -(bg_dy / H) * v_fov
 
-        now = time.time()
-        dt_tick = now - self._last_tick_ts if self._last_tick_ts else (TICK_MS / 1000.0)
-        self._last_tick_ts = now
+        if bbox is not None and have_target:
+            self.tracker.init(gray, bbox)
+            self.have_target = not self.tracker.lost
 
-        # ---------------------------------------------------------------
-        # New SAM sample: fuse measurement and update velocity estimate.
-        # ---------------------------------------------------------------
-        new_sample = (
-            have_target
-            and bbox is not None
-            and capture_ts > self._last_consumed_capture_ts + 1e-4
-        )
+        if self.have_target:
+            cx, cy, lost = self.tracker.update(gray)
+            self.have_target = not lost
+            if self.have_target:
+                err_x = cx - W / 2.0
+                err_y = cy - H / 2.0
+                yaw = YAW_SIGN * (err_x / W) * HORIZONTAL_FOV_RAD
+                pitch = PITCH_SIGN * (err_y / H) * v_fov
 
-        if new_sample:
-            self._last_consumed_capture_ts = capture_ts
-            sam_lag_ms = (now - capture_ts) * 1000.0
+                # Proportional follow + camera-motion damping.
+                # When the head is already turning fast, cam_yaw has the
+                # same sign as yaw; subtracting it brakes the motion.
+                yaw_cmd = GAIN * yaw - DAMP * cam_yaw
+                pitch_cmd = GAIN * pitch - DAMP * cam_pitch
 
-            cx = (bbox[0] + bbox[2]) / 2.0
-            cy = (bbox[1] + bbox[3]) / 2.0
-            err_x_px = cx - W / 2.0
-            err_y_px = cy - H / 2.0
-
-            err_yaw_cam = (err_x_px / W) * HORIZONTAL_FOV_RAD
-            err_pitch_cam = (err_y_px / H) * v_fov_rad
-
-            past_yaw, past_pitch = self._angle_at(capture_ts)
-            meas_yaw = past_yaw + YAW_SIGN * err_yaw_cam
-            meas_pitch = past_pitch + PITCH_SIGN * err_pitch_cam
-
-            # Update predictor velocity from last SAM measurement to this one.
-            if self._pred_valid:
-                dt_sam = capture_ts - self._last_sam_ts
-                if dt_sam > PREDICTOR_MIN_DELTA_S:
-                    self._vel_yaw = (meas_yaw - self._last_sam_yaw) / dt_sam
-                    self._vel_pitch = (meas_pitch - self._last_sam_pitch) / dt_sam
-
-            self._last_sam_yaw = meas_yaw
-            self._last_sam_pitch = meas_pitch
-            self._last_sam_ts = capture_ts
-            self._pred_valid = True
-
-            # Fuse measurement into world target (partial correction).
-            if (
-                abs(err_yaw_cam) > DEADZONE_RAD
-                or abs(err_pitch_cam) > DEADZONE_RAD
-            ):
-                self._target_yaw_world = (
-                    (1 - CONTROL_GAIN) * self._target_yaw_world
-                    + CONTROL_GAIN * meas_yaw
+                yaw_cmd = max(-YAW_LIMIT_RAD, min(YAW_LIMIT_RAD, yaw_cmd))
+                pitch_cmd = max(-PITCH_LIMIT_RAD, min(PITCH_LIMIT_RAD, pitch_cmd))
+                return ControlSnap(
+                    err_yaw_rad=yaw,
+                    err_pitch_rad=pitch,
+                    cmd_yaw=yaw_cmd,
+                    cmd_pitch=pitch_cmd,
+                    have_target=True,
+                    sam_lag_ms=0.0,
                 )
-                self._target_pitch_world = (
-                    (1 - CONTROL_GAIN) * self._target_pitch_world
-                    + CONTROL_GAIN * meas_pitch
-                )
-
-        # ---------------------------------------------------------------
-        # Predict / coast between SAM frames so the head never freezes.
-        # ---------------------------------------------------------------
-        age_since_sam = now - self._last_sam_ts
-        if self._pred_valid and age_since_sam < PREDICTOR_MAX_AGE_S:
-            # Extrapolate target motion using estimated velocity.
-            self._target_yaw_world += self._vel_yaw * dt_tick
-            self._target_pitch_world += self._vel_pitch * dt_tick
-        elif not have_target:
-            self._target_yaw_world *= RECENTER_DECAY_PER_TICK
-            self._target_pitch_world *= RECENTER_DECAY_PER_TICK
-        # else: stale SAM but still coasting — hold predicted target.
-
-        # Clamp to head workspace.
-        self._target_yaw_world = _clamp(
-            self._target_yaw_world, -YAW_LIMIT_RAD, YAW_LIMIT_RAD
-        )
-        self._target_pitch_world = _clamp(
-            self._target_pitch_world, -PITCH_LIMIT_RAD, PITCH_LIMIT_RAD
-        )
-
-        # Smooth ease toward the (possibly extrapolated) target.
-        max_dy = math.radians(MAX_YAW_RATE_DPS) * dt_tick
-        max_dp = math.radians(MAX_PITCH_RATE_DPS) * dt_tick
-        dy = (self._target_yaw_world - self._cmd_yaw) * CMD_SMOOTH_ALPHA
-        dp = (self._target_pitch_world - self._cmd_pitch) * CMD_SMOOTH_ALPHA
-        dy = _clamp(dy, -max_dy, max_dy)
-        dp = _clamp(dp, -max_dp, max_dp)
-        self._cmd_yaw += dy
-        self._cmd_pitch += dp
-
-        self._record_history()
 
         return ControlSnap(
-            err_yaw_rad=err_yaw_cam,
-            err_pitch_rad=err_pitch_cam,
-            cmd_yaw=self._cmd_yaw,
-            cmd_pitch=self._cmd_pitch,
-            have_target=have_target,
-            sam_lag_ms=sam_lag_ms,
+            err_yaw_rad=0.0,
+            err_pitch_rad=0.0,
+            cmd_yaw=0.0,
+            cmd_pitch=0.0,
+            have_target=False,
+            sam_lag_ms=0.0,
         )
 
 
@@ -759,6 +725,95 @@ def _pick_camera(cams, prefer_reachy: bool) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Control thread — runs head controller + Reachy at a fixed rate,
+# completely separate from the Tk GUI tick.  This guarantees smooth
+# servo motion even when PhotoImage or camera stalls the UI.
+# ---------------------------------------------------------------------------
+class ControlThread(threading.Thread):
+    def __init__(
+        self,
+        follower: Sam3Follower,
+        controller: SimpleController,
+        reachy,
+        drive_event: threading.Event,
+    ):
+        super().__init__(daemon=True, name="control")
+        self.follower = follower
+        self.controller = controller
+        self.reachy = reachy
+        self._drive = drive_event
+        self._stop = threading.Event()
+        self._reset_pending = threading.Event()
+        self._home_pending = threading.Event()
+        self._snap_lock = threading.Lock()
+        self._latest_snap: Optional[ControlSnap] = None
+        self._latest_frame: Optional[np.ndarray] = None
+        self._latest_hw: Optional[tuple[int, int]] = None
+
+    def set_frame(self, frame: np.ndarray, hw: tuple[int, int]) -> None:
+        self._latest_frame = frame
+        self._latest_hw = hw
+
+    def request_reset(self) -> None:
+        self._reset_pending.set()
+
+    def request_home(self) -> None:
+        self._home_pending.set()
+
+    def get_latest_snap(self) -> Optional[ControlSnap]:
+        with self._snap_lock:
+            return self._latest_snap
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.time()
+
+            if self._home_pending.is_set():
+                self.controller.reset()
+                try:
+                    self.reachy.set_target(head=_head_pose_rpy(0.0, 0.0, 0.0))
+                except Exception as e:
+                    print(f"[control] home failed: {e}")
+                self._home_pending.clear()
+                continue  # skip normal step this tick
+
+            if self._reset_pending.is_set():
+                self.controller.reset()
+                self._reset_pending.clear()
+
+            frame = self._latest_frame
+            hw = self._latest_hw
+            if frame is None or hw is None:
+                time.sleep(TICK_MS / 1000.0)
+                continue
+
+            f_state, bbox, age, capture_ts = self.follower.get_current_bbox()
+            have_target = (
+                bbox is not None
+                and f_state == FollowState.TRACKING
+                and age < COAST_S
+            )
+            snap = self.controller.step(frame, bbox, hw, have_target, capture_ts)
+
+            with self._snap_lock:
+                self._latest_snap = snap
+
+            if self._drive.is_set():
+                try:
+                    self.reachy.set_target(
+                        head=_head_pose_rpy(0.0, snap.cmd_pitch, snap.cmd_yaw)
+                    )
+                except Exception as e:
+                    print(f"[control] set_target failed: {e}")
+
+            elapsed = time.time() - t0
+            time.sleep(max(0.0, TICK_MS / 1000.0 - elapsed))
+
+
+# ---------------------------------------------------------------------------
 # Tk app
 # ---------------------------------------------------------------------------
 STATE_COLORS = {
@@ -778,7 +833,7 @@ class App:
         self,
         root: tk.Tk,
         follower: Sam3Follower,
-        controller: HeadFollower,
+        controller: SimpleController,
         reachy,
         reachy_label: str,
         initial_concept: str,
@@ -791,8 +846,19 @@ class App:
         self.reachy_label = reachy_label
         self._photo: Optional[ImageTk.PhotoImage] = None
         self._drive_enabled = tk.BooleanVar(value=True)
+        self._drive_event = threading.Event()
+        self._drive_event.set()
         self._last_state = FollowState.IDLE
         self._tick_counter = 0
+
+        # Mirror tk.BooleanVar changes to the threading.Event so the
+        # control thread can read drive state safely.
+        def _sync_drive(*_):
+            if self._drive_enabled.get():
+                self._drive_event.set()
+            else:
+                self._drive_event.clear()
+        self._drive_enabled.trace_add("write", _sync_drive)
 
         self.cameras = discover_cameras()
         print(f"[camera] detected: {self.cameras}")
@@ -801,6 +867,15 @@ class App:
         self._build_ui(initial_concept)
         self.cap: Optional[cv2.VideoCapture] = None
         self._open_camera(self.current_cam_index)
+
+        # Spin up the dedicated control thread (servo loop separated from Tk).
+        self.control_thread = ControlThread(
+            follower=self.follower,
+            controller=self.controller,
+            reachy=self.reachy,
+            drive_event=self._drive_event,
+        )
+        self.control_thread.start()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(0, self._tick)
@@ -892,7 +967,7 @@ class App:
         if not concept:
             self._set_status("Type a concept first.", "orange")
             return
-        self.controller.reset()
+        self.control_thread.request_reset()
         self.follower.start_following(concept)
         self._set_status(f"Locking on '{concept}' …", "blue")
 
@@ -901,11 +976,7 @@ class App:
         self._set_status("Released — head will decay to neutral.", "black")
 
     def _on_home(self) -> None:
-        self.controller.reset()
-        try:
-            self.reachy.set_target(head=_head_pose_rpy(0.0, 0.0, 0.0))
-        except Exception as e:
-            print(f"[reachy] home failed: {e}")
+        self.control_thread.request_home()
 
     def _tick(self) -> None:
         if self.cap is None:
@@ -916,24 +987,21 @@ class App:
             self.root.after(TICK_MS, self._tick)
             return
 
+        # Downscale aggressively — the camera may deliver 2448p but SAM
+        # runs at imgsz=448. Feeding huge frames wastes CPU/GPU memory
+        # and slows the whole pipeline.
+        if frame.shape[0] > 720:
+            scale = 720 / frame.shape[0]
+            new_w = int(frame.shape[1] * scale)
+            frame = cv2.resize(
+                frame, (new_w, 720), interpolation=cv2.INTER_AREA
+            )
+
         H, W = frame.shape[:2]
         self.follower.push_frame(frame)
+        # Feed full frame to the control thread for KLT tracking.
+        self.control_thread.set_frame(frame.copy(), (H, W))
         f_state, bbox, age, capture_ts = self.follower.get_current_bbox()
-
-        have_target = (
-            bbox is not None
-            and f_state == FollowState.TRACKING
-            and age < COAST_S
-        )
-        snap = self.controller.step(bbox, (H, W), have_target, capture_ts)
-
-        if self._drive_enabled.get():
-            try:
-                self.reachy.set_target(
-                    head=_head_pose_rpy(0.0, snap.cmd_pitch, snap.cmd_yaw)
-                )
-            except Exception as e:
-                print(f"[reachy] set_target failed: {e}")
 
         # Display — only every 2nd tick so ImageTk conversion doesn't
         # starve the control loop on macOS (Tk PhotoImage is slow).
@@ -960,25 +1028,29 @@ class App:
             disp_w, disp_h = W, H
             display = frame.copy() if bbox is not None else frame
 
-        if bbox is not None and f_state in (FollowState.TRACKING, FollowState.LOST):
-            if scale != 1.0 and display is frame:
-                display = cv2.resize(
-                    frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA
-                )
-            x1, y1, x2, y2 = bbox
-            x1 = int(round(x1 * scale))
-            y1 = int(round(y1 * scale))
-            x2 = int(round(x2 * scale))
-            y2 = int(round(y2 * scale))
-            color = (0, 255, 0) if f_state == FollowState.TRACKING else (0, 0, 255)
-            cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
-            cv2.drawMarker(display, (cx, cy), (0, 255, 255),
-                           cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+        snap = self.control_thread.get_latest_snap()
+        have_target = snap.have_target if snap is not None else False
+
+        # Draw tracked target (KLT = red dot every frame, SAM = green box)
+        if have_target or (bbox is not None and f_state in (FollowState.TRACKING, FollowState.LOST)):
+            tx = int(round(self.controller.tracker.cx * scale))
+            ty = int(round(self.controller.tracker.cy * scale))
+            if bbox is not None and f_state in (FollowState.TRACKING, FollowState.LOST):
+                if scale != 1.0 and display is frame:
+                    display = cv2.resize(
+                        frame, (disp_w, disp_h), interpolation=cv2.INTER_AREA
+                    )
+                x1, y1, x2, y2 = bbox
+                x1 = int(round(x1 * scale))
+                y1 = int(round(y1 * scale))
+                x2 = int(round(x2 * scale))
+                y2 = int(round(y2 * scale))
+                color = (0, 255, 0) if f_state == FollowState.TRACKING else (0, 0, 255)
+                cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
+            cv2.circle(display, (tx, ty), 6, (0, 0, 255), -1, cv2.LINE_AA)
             cv2.drawMarker(display, (disp_w // 2, disp_h // 2), (255, 255, 255),
                            cv2.MARKER_TILTED_CROSS, 12, 1, cv2.LINE_AA)
-            cv2.line(display, (disp_w // 2, disp_h // 2), (cx, cy),
+            cv2.line(display, (disp_w // 2, disp_h // 2), (tx, ty),
                      (0, 255, 255), 1, cv2.LINE_AA)
 
         if f_state != self._last_state:
@@ -991,6 +1063,13 @@ class App:
         st = self.follower.get_stats()
         med_ms = st.get("median_ms", 0.0)
         fps = (1000.0 / med_ms) if med_ms else 0.0
+        snap = self.control_thread.get_latest_snap()
+        if snap is None:
+            snap = ControlSnap(
+                err_yaw_rad=0.0, err_pitch_rad=0.0,
+                cmd_yaw=0.0, cmd_pitch=0.0,
+                have_target=False, sam_lag_ms=0.0,
+            )
         self.stats_label.config(
             text=(
                 f"Reachy: {self.reachy_label}  |  "
@@ -1010,6 +1089,8 @@ class App:
         self.root.after(TICK_MS, self._tick)
 
     def _on_close(self) -> None:
+        self.control_thread.stop()
+        self.control_thread.join(timeout=1.0)
         try:
             self.follower.stop_following()
             self.follower.close()
@@ -1045,10 +1126,10 @@ def main() -> None:
     ap.add_argument("--no-reachy-camera", action="store_true")
     args = ap.parse_args()
 
-    print(f"[startup] device={DEVICE} fov={HORIZONTAL_FOV_DEG:.1f}° gain={CONTROL_GAIN}")
+    print(f"[startup] device={DEVICE} fov={HORIZONTAL_FOV_DEG:.1f}° direct-follow")
 
     follower = Sam3Follower()
-    controller = HeadFollower()
+    controller = SimpleController()
     reachy, reachy_label = _open_reachy(enable=not args.no_reachy, sim=args.sim)
     print(f"[startup] reachy: {reachy_label}")
 
