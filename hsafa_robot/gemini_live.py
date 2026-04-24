@@ -687,6 +687,9 @@ class GeminiLiveSession:
             except Exception:
                 args = {}
 
+            t0 = time.monotonic()
+            print(f"\n[TOOL CALL START] {name}({args})  t={t0:.6f}")
+
             if self._tool_handler is None:
                 log.warning("tool_call '%s' but no tool_handler registered", name)
                 result: Dict[str, Any] = {
@@ -703,7 +706,9 @@ class GeminiLiveSession:
             if not isinstance(result, dict):
                 result = {"ok": True, "value": result}
 
-            log.info("tool_call %s(%s) -> %s", name, args, result)
+            elapsed = time.monotonic() - t0
+            print(f"[TOOL CALL DONE ] {name} -> {result}  elapsed={elapsed:.3f}s\n")
+            log.info("tool_call %s(%s) -> %s  (%.3fs)", name, args, result, elapsed)
 
             responses.append(
                 types.FunctionResponse(

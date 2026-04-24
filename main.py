@@ -143,9 +143,19 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "scoring engine (default), `mode=\"speaker\"` biases it toward "
     "the current speaker.\n"
     "When a focus call succeeds briefly describe what you are doing "
-    "(\"okay, watching you\" / \"following the speaker\"); if it fails "
+    '("okay, watching you" / "following the speaker"); if it fails '
     "because the person is not visible, say so and suggest stepping "
     "into view."
+    "\n\n"
+    "You can also directly control the robot's head angles: "
+    "`set_head_angle(yaw_deg, pitch_deg)` moves to specific degrees "
+    "(yaw -60..+60 left/right, pitch -30..+30 up/down). "
+    "`look_straight()` resets to center. `look_left`, `look_right`, "
+    "`look_up`, `look_down` are convenience presets. "
+    "`enable_face_follow()` resumes automatic face tracking; "
+    "`disable_face_follow()` freezes the head at its current angle. "
+    "The robot starts with face following DISABLED, so you must call "
+    "`enable_face_follow()` if the user wants you to track them."
     "\n\n"
     "You can also sense hand gestures (wave, point, thumbs_up, "
     "open_palm, fist). When you notice a gesture mentioned in the "
@@ -176,6 +186,161 @@ DEFAULT_SYSTEM_INSTRUCTION = (
 
 FACE_DB_DIR = Path(__file__).resolve().parent / "data" / "faces"
 IDENTITY_DIR = Path(__file__).resolve().parent / "data" / "identity"
+
+
+def build_test_tools() -> list:
+    """Simple test tools that work even without face recognition."""
+    return [
+        genai_types.Tool(
+            function_declarations=[
+                genai_types.FunctionDeclaration(
+                    name="get_current_time",
+                    description=(
+                        "Return the current local time and date. "
+                        "Useful when the user asks 'what time is it' or "
+                        "wants a timestamp."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="ping",
+                    description=(
+                        "A quick health-check tool. Returns 'pong'. "
+                        "Use this when the user says 'ping', "
+                        "'are you there', or wants to test responsiveness."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="get_robot_status",
+                    description=(
+                        "Return basic robot runtime status. "
+                        "Use when the user asks 'what is your status', "
+                        "'how are you', or similar diagnostic questions."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="set_head_angle",
+                    description=(
+                        "Move the robot's head to a specific yaw and pitch "
+                        "angle in degrees. yaw=0 looks straight ahead; "
+                        "positive yaw turns left, negative turns right. "
+                        "pitch=0 is level; positive looks down, negative "
+                        "looks up. Range: yaw -60..+60, pitch -30..+30. "
+                        "Use when the user says 'look left', 'look right', "
+                        "'look up', 'look down', or gives specific angles. "
+                        "This disables automatic face following until "
+                        "`enable_face_follow` is called."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={
+                            "yaw_deg": genai_types.Schema(
+                                type=genai_types.Type.NUMBER,
+                                description="Head yaw in degrees. 0 = center, positive = left, negative = right. Range -60..60.",
+                            ),
+                            "pitch_deg": genai_types.Schema(
+                                type=genai_types.Type.NUMBER,
+                                description="Head pitch in degrees. 0 = level, positive = down, negative = up. Range -30..30.",
+                            ),
+                        },
+                        required=["yaw_deg", "pitch_deg"],
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="look_straight",
+                    description=(
+                        "Reset the robot's head to center (yaw=0, pitch=0). "
+                        "Use when the user says 'look straight', 'center', "
+                        "'reset your head', or 'look forward'."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="look_left",
+                    description=(
+                        "Turn the robot's head 30 degrees to the left. "
+                        "Use when the user says 'look left'."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="look_right",
+                    description=(
+                        "Turn the robot's head 30 degrees to the right. "
+                        "Use when the user says 'look right'."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="look_up",
+                    description=(
+                        "Tilt the robot's head 15 degrees up. "
+                        "Use when the user says 'look up'."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="look_down",
+                    description=(
+                        "Tilt the robot's head 15 degrees down. "
+                        "Use when the user says 'look down'."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="enable_face_follow",
+                    description=(
+                        "Enable automatic face tracking. The robot will "
+                        "follow the closest visible person. Use when the user "
+                        "says 'follow me', 'track my face', or 'look at people'."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="disable_face_follow",
+                    description=(
+                        "Disable automatic face tracking. The head will "
+                        "stay at its current angle until moved by another "
+                        "command. Use when the user says 'stop following', "
+                        "'don't follow me', or 'freeze'."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={},
+                    ),
+                ),
+            ],
+        ),
+    ]
 
 
 def build_face_tools() -> list:
@@ -585,6 +750,7 @@ def make_tool_handler(
     world: Optional[WorldStateHolder] = None,
     identity_graph: Optional[IdentityGraph] = None,
     gesture_tracker: "Optional[GestureTracker]" = None,
+    controller: Optional["RobotController"] = None,
 ):
     """Build the async tool handler closure Gemini Live will call."""
 
@@ -800,6 +966,78 @@ def make_tool_handler(
                     f"'normal' / 'person' / 'speaker'"
                 ),
             }
+
+        if name == "get_current_time":
+            return {"ok": True, "time": time.strftime("%H:%M:%S"), "date": time.strftime("%Y-%m-%d")}
+
+        if name == "ping":
+            return {"ok": True, "pong": True}
+
+        if name == "get_robot_status":
+            return {
+                "ok": True,
+                "face_recognition": recognizer is not None,
+                "lip_tracker": lip_tracker is not None,
+                "focus_manager": focus_manager is not None,
+            }
+
+        def _clamp_angle(v: float, lo: float, hi: float) -> float:
+            return max(lo, min(hi, v))
+
+        if name == "set_head_angle":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            yaw = float(args.get("yaw_deg", 0))
+            pitch = float(args.get("pitch_deg", 0))
+            yaw = _clamp_angle(yaw, -60, 60)
+            pitch = _clamp_angle(pitch, -30, 30)
+            controller.set_manual_target(yaw_deg=yaw, pitch_deg=pitch)
+            return {"ok": True, "yaw_deg": yaw, "pitch_deg": pitch, "mode": "manual"}
+
+        if name == "look_straight":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            controller.set_manual_target(yaw_deg=0, pitch_deg=0)
+            return {"ok": True, "yaw_deg": 0, "pitch_deg": 0, "mode": "manual"}
+
+        if name == "look_left":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            controller.set_manual_target(yaw_deg=30, pitch_deg=0)
+            return {"ok": True, "yaw_deg": 30, "pitch_deg": 0, "mode": "manual"}
+
+        if name == "look_right":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            controller.set_manual_target(yaw_deg=-30, pitch_deg=0)
+            return {"ok": True, "yaw_deg": -30, "pitch_deg": 0, "mode": "manual"}
+
+        if name == "look_up":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            controller.set_manual_target(yaw_deg=0, pitch_deg=-15)
+            return {"ok": True, "yaw_deg": 0, "pitch_deg": -15, "mode": "manual"}
+
+        if name == "look_down":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            controller.set_manual_target(yaw_deg=0, pitch_deg=15)
+            return {"ok": True, "yaw_deg": 0, "pitch_deg": 15, "mode": "manual"}
+
+        if name == "enable_face_follow":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            controller.clear_manual()
+            return {"ok": True, "mode": "auto_follow"}
+
+        if name == "disable_face_follow":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            controller.set_manual_target(
+                yaw_deg=math.degrees(controller.snapshot.sent_yaw),
+                pitch_deg=math.degrees(controller.snapshot.sent_pitch),
+            )
+            return {"ok": True, "mode": "manual"}
 
         if name == "describe_scene":
             if world is None:
@@ -1378,6 +1616,18 @@ def main() -> None:
                 return sample
 
             # --- Gemini Live ------------------------------------------------
+            reachy.goto_target(head=head_pose(), duration=0.8, body_yaw=0.0)
+            time.sleep(0.3)
+
+            # Mutable speaking flag so we can create the controller before
+            # gemini exists, then wire it in once the session is live.
+            _speaking_fn = {"fn": lambda: False}
+            is_talking_fn = lambda: _speaking_fn["fn"]()
+
+            controller = RobotController(
+                reachy, tracker, is_talking_fn, no_body=args.no_body,
+            )
+
             if not args.no_gemini:
                 if not api_key:
                     log.warning("GEMINI_API_KEY not set - running without voice. "
@@ -1393,30 +1643,28 @@ def main() -> None:
                         mic_source=_mic_source_tee,
                         speaker_sink=media.push_audio_sample,
                     )
+                    all_tools = []
                     if face_recognizer is not None and face_tools is not None:
-                        kwargs["tools"] = face_tools
+                        all_tools.extend(face_tools)
+                    # Always include test tools so Gemini can exercise
+                    # function calling even when face recognition is off.
+                    all_tools.extend(build_test_tools())
+                    if all_tools:
+                        kwargs["tools"] = all_tools
                         kwargs["tool_handler"] = make_tool_handler(
                             face_recognizer, latest, lip_tracker,
                             focus_manager, tracker,
                             world=world,
                             identity_graph=identity_graph,
                             gesture_tracker=gesture_tracker,
+                            controller=controller,
                         )
                     model = args.model or os.environ.get("GEMINI_MODEL")
                     if model:
                         kwargs["model"] = model
                     gemini = GeminiLiveSession(**kwargs)
                     gemini.start()
-
-            is_talking_fn = (gemini.is_speaking.is_set
-                             if gemini is not None else (lambda: False))
-
-            reachy.goto_target(head=head_pose(), duration=0.8, body_yaw=0.0)
-            time.sleep(0.3)
-
-            controller = RobotController(
-                reachy, tracker, is_talking_fn, no_body=args.no_body,
-            )
+                    _speaking_fn["fn"] = gemini.is_speaking.is_set
 
             # Hook bus -> controller: on person_left, trigger a
             # directed search sweep from the last-known head yaw.

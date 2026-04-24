@@ -159,6 +159,13 @@ class RobotController:
         self._last_det_ts = 0.0
         self._last_tick = time.time()
 
+        # Manual head override (when Gemini or user takes direct control).
+        # Start in manual mode so the robot does NOT auto-follow faces.
+        self._manual_override = True
+        self._manual_yaw = 0.0
+        self._manual_pitch = 0.0
+        self._manual_body_yaw = 0.0
+
         # Public snapshot for logging / preview
         self.snapshot = ControlSnapshot(
             tier=TIER_NONE, track_id=None, have_face=False,
@@ -190,6 +197,27 @@ class RobotController:
 
     def cue_listener_glance(self, other_person_yaw_rad: float) -> None:
         self._natural_gaze.cue_listener_glance(other_person_yaw_rad)
+
+    # ---- Manual head override ------------------------------------------
+    def set_manual_target(
+        self,
+        yaw_deg: float = 0.0,
+        pitch_deg: float = 0.0,
+        body_yaw_deg: float = 0.0,
+    ) -> None:
+        """Lock head (and optionally body) to fixed angles; disable face tracking."""
+        self._manual_override = True
+        self._manual_yaw = math.radians(float(yaw_deg))
+        self._manual_pitch = math.radians(float(pitch_deg))
+        self._manual_body_yaw = math.radians(float(body_yaw_deg))
+
+    def clear_manual(self) -> None:
+        """Return to automatic face-tracking mode."""
+        self._manual_override = False
+
+    @property
+    def is_manual(self) -> bool:
+        return self._manual_override
 
     def mark_humans_seen(self) -> None:
         """Called by the main loop while at least one human is visible."""
@@ -236,15 +264,34 @@ class RobotController:
         )
 
         # ---- 2. Error smoothing & P-controller --------------------------
-        if have_face:
-            self._err_x_s = (1 - ERR_ALPHA) * self._err_x_s + ERR_ALPHA * err_x
-            self._err_y_s = (1 - ERR_ALPHA) * self._err_y_s + ERR_ALPHA * err_y
+        # If manual override is active, skip face tracking and drive
+        # directly toward the commanded angles.
+        if self._manual_override:
+            self._cmd_yaw += (
+                KP_YAW * (self._manual_yaw - self._cmd_yaw) * STEP_SCALE
+            )
+            self._cmd_pitch += (
+                KP_PITCH * (self._manual_pitch - self._cmd_pitch) * STEP_SCALE
+            )
+            self._body_yaw += (
+                BODY_ALPHA * (self._manual_body_yaw - self._body_yaw)
+            )
+            self._err_x_s = 0.0
+            self._err_y_s = 0.0
+            was_moving = (
+                abs(self._cmd_yaw - self._manual_yaw) > DEADZONE
+                or abs(self._cmd_pitch - self._manual_pitch) > DEADZONE
+            )
+        else:
+            if have_face:
+                self._err_x_s = (1 - ERR_ALPHA) * self._err_x_s + ERR_ALPHA * err_x
+                self._err_y_s = (1 - ERR_ALPHA) * self._err_y_s + ERR_ALPHA * err_y
 
-        # Track whether the controller is actively moving (for micro-
-        # saccade bookkeeping).
-        was_moving = (
-            abs(self._err_x_s) > DEADZONE or abs(self._err_y_s) > DEADZONE
-        )
+            # Track whether the controller is actively moving (for micro-
+            # saccade bookkeeping).
+            was_moving = (
+                abs(self._err_x_s) > DEADZONE or abs(self._err_y_s) > DEADZONE
+            )
 
         # Gain scale from the planner -- saccades multiply KP for a
         # ballistic snap; idle drift uses gain 1.0 because it overrides
