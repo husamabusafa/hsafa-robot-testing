@@ -41,9 +41,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import json
 import logging
 import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -54,9 +57,12 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 from dotenv import load_dotenv
+from google import genai
 from google.genai import types as genai_types
 from reachy_mini import ReachyMini
 
+LOOK_AT_MODEL = "qwen/qwen3-vl-8b-instruct"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 from hsafa_robot.audio_vad import SileroVAD
 from hsafa_robot.events import (
     EVT_PERSON_LEFT,
@@ -155,7 +161,13 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "`enable_face_follow()` resumes automatic face tracking; "
     "`disable_face_follow()` freezes the head at its current angle. "
     "The robot starts with face following DISABLED, so you must call "
-    "`enable_face_follow()` if the user wants you to track them."
+    "`enable_face_follow()` if the user wants you to track them.\n\n"
+    "You can also look at specific objects in view: "
+    "`look_at(description)` uses computer vision to find the described "
+    "object (e.g. 'the red cup', 'my phone'), marks its location with "
+    "a bright box on the camera preview, and moves the head to stare "
+    "at it. Use it when the user points something out or asks you to "
+    "look at a specific item."
     "\n\n"
     "You can also sense hand gestures (wave, point, thumbs_up, "
     "open_palm, fist). When you notice a gesture mentioned in the "
@@ -336,6 +348,29 @@ def build_test_tools() -> list:
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
                         properties={},
+                    ),
+                ),
+                genai_types.FunctionDeclaration(
+                    name="look_at",
+                    description=(
+                        "Look at a specific object in the camera view. "
+                        "Describe the object (e.g. 'the red cup', 'my phone', "
+                        "'the book on the table') and the robot will use "
+                        "computer vision to locate it, move its head to stare "
+                        "directly at it, and draw a bright bounding box on the "
+                        "preview showing exactly where it is. Use when the user "
+                        "says 'look at the X', 'find the Y', 'what is that Z', "
+                        "or any request to direct attention to a visible object."
+                    ),
+                    parameters=genai_types.Schema(
+                        type=genai_types.Type.OBJECT,
+                        properties={
+                            "description": genai_types.Schema(
+                                type=genai_types.Type.STRING,
+                                description="Description of the object to look at, e.g. 'the red cup on the desk'",
+                            ),
+                        },
+                        required=["description"],
                     ),
                 ),
             ],
@@ -741,6 +776,101 @@ def _bbox_iou_simple(a, b) -> float:
     return inter / max(1, a_area + b_area - inter)
 
 
+def _look_at_object(
+    api_key: str, jpeg_bytes: bytes, description: str,
+    frame_w: int, frame_h: int,
+) -> dict:
+    """Ask Qwen3-VL on OpenRouter to locate an object.
+
+    Returns:
+        {"found": bool, "nx": float, "ny": float,
+         "bbox_norm": [xmin, ymin, xmax, ymax] (0..1),
+         "confidence": str, "label": str,
+         "error": str|None}
+    """
+    try:
+        from openai import OpenAI
+
+        or_key = os.getenv("OPENROUTER_API_KEY", api_key)
+        if not or_key:
+            return {"found": False, "error": "OPENROUTER_API_KEY not set"}
+        client = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=or_key)
+
+        b64 = base64.b64encode(jpeg_bytes).decode("ascii")
+        data_url = f"data:image/jpeg;base64,{b64}"
+
+        prompt = (
+            f"Locate the {description} in the image. "
+            f"Return ONLY a JSON object of the form "
+            f'{{"bbox_2d": [x1, y1, x2, y2], "label": "{description}"}} '
+            f"using absolute pixel coordinates in an image that is "
+            f"{frame_w} pixels wide and {frame_h} pixels tall. "
+            f'If the {description} is not visible, return '
+            f'{{"bbox_2d": null}}.'
+        )
+
+        response = client.chat.completions.create(
+            model=LOOK_AT_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+            max_tokens=128,
+            temperature=0.0,
+        )
+        text = response.choices[0].message.content or ""
+
+        # Extract first JSON object from the response
+        match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
+        if not match:
+            return {"found": False, "error": "no JSON in model response"}
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return {"found": False, "error": "invalid JSON in model response"}
+
+        bbox = data.get("bbox_2d") or data.get("bbox") or data.get("box")
+        if not bbox or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            return {"found": False, "error": "object not visible"}
+
+        x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+
+        # Some Qwen variants output normalized [0..1000] — detect and rescale
+        if max(x1, y1, x2, y2) <= 1000 and max(frame_w, frame_h) > 1000:
+            x1 = int(x1 * frame_w / 1000)
+            x2 = int(x2 * frame_w / 1000)
+            y1 = int(y1 * frame_h / 1000)
+            y2 = int(y2 * frame_h / 1000)
+
+        # Clamp & sanity-check
+        x1 = max(0, min(frame_w - 1, x1))
+        x2 = max(0, min(frame_w - 1, x2))
+        y1 = max(0, min(frame_h - 1, y1))
+        y2 = max(0, min(frame_h - 1, y2))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return {"found": False, "error": "bbox too small"}
+
+        # Convert to normalized 0..1
+        nx = (x1 + x2) / 2.0 / max(1, frame_w)
+        ny = (y1 + y2) / 2.0 / max(1, frame_h)
+        return {
+            "found": True,
+            "nx": nx,
+            "ny": ny,
+            "bbox_norm": [
+                x1 / max(1, frame_w), y1 / max(1, frame_h),
+                x2 / max(1, frame_w), y2 / max(1, frame_h),
+            ],
+            "confidence": "high",
+            "label": data.get("label", description),
+        }
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+
 def make_tool_handler(
     recognizer: FaceRecognizer,
     latest: "LatestFrame",
@@ -751,6 +881,9 @@ def make_tool_handler(
     identity_graph: Optional[IdentityGraph] = None,
     gesture_tracker: "Optional[GestureTracker]" = None,
     controller: Optional["RobotController"] = None,
+    api_key: Optional[str] = None,
+    frame_w: int = 640,
+    frame_h: int = 480,
 ):
     """Build the async tool handler closure Gemini Live will call."""
 
@@ -1088,6 +1221,55 @@ def make_tool_handler(
                 "people": seen,
             }
 
+        if name == "look_at":
+            if controller is None:
+                return {"ok": False, "error": "robot controller not available"}
+            if not api_key:
+                return {"ok": False, "error": "API key not available for vision query"}
+            description = str(args.get("description", "")).strip()
+            if not description:
+                return {"ok": False, "error": "description is required"}
+
+            jpeg = latest.get_mirrored_jpeg()
+            if jpeg is None:
+                return {"ok": False, "error": "no camera frame available"}
+
+            # Fire-and-forget: reply instantly so Gemini Live isn't blocked,
+            # then run the slow vision query in the background.
+            async def _look_at_task() -> None:
+                try:
+                    result = await asyncio.to_thread(
+                        _look_at_object, api_key, jpeg, description,
+                        frame_w, frame_h,
+                    )
+                    if not result.get("found"):
+                        log.info("look_at background: not found: %s",
+                                 result.get("error"))
+                        return
+                    nx = result["nx"]
+                    ny = result["ny"]
+                    _set_look_at_marker(
+                        nx, ny, description,
+                        bbox_norm=result.get("bbox_norm"),
+                    )
+                    if controller is not None:
+                        yaw_deg = (nx - 0.5) * 120.0
+                        pitch_deg = (ny - 0.5) * 60.0
+                        yaw_deg = max(-60.0, min(60.0, yaw_deg))
+                        pitch_deg = max(-30.0, min(30.0, pitch_deg))
+                        controller.set_manual_target(
+                            yaw_deg=yaw_deg, pitch_deg=pitch_deg,
+                        )
+                except Exception:
+                    log.exception("look_at background task failed")
+
+            asyncio.create_task(_look_at_task())
+            return {
+                "ok": True,
+                "status": "searching",
+                "description": description,
+            }
+
         return {"ok": False, "error": f"unknown tool: {name}"}
 
     return handler
@@ -1122,6 +1304,18 @@ class LatestFrame:
             return None
         ok, buf = cv2.imencode(
             ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality],
+        )
+        return buf.tobytes() if ok else None
+
+    def get_mirrored_jpeg(self) -> Optional[bytes]:
+        with self._lock:
+            frame = self._frame
+        if frame is None:
+            return None
+        mirrored = cv2.flip(frame, 1)
+        ok, buf = cv2.imencode(
+            ".jpg", mirrored,
+            [int(cv2.IMWRITE_JPEG_QUALITY), self._jpeg_quality],
         )
         return buf.tobytes() if ok else None
 
@@ -1178,6 +1372,31 @@ def enhance_brightness(frame: np.ndarray) -> np.ndarray:
     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
     ycrcb[..., 0] = _CLAHE.apply(ycrcb[..., 0])
     return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+
+
+# --- Look-at marker (shared between tool handler and overlay) ---------------
+_LOOK_AT_LOCK = threading.Lock()
+_LOOK_AT_MARKER: dict = {}  # x, y, description, timestamp
+
+
+def _set_look_at_marker(
+    x: float, y: float, description: str,
+    bbox_norm: Optional[list] = None,
+) -> None:
+    with _LOOK_AT_LOCK:
+        _LOOK_AT_MARKER["nx"] = float(x)
+        _LOOK_AT_MARKER["ny"] = float(y)
+        _LOOK_AT_MARKER["description"] = description
+        _LOOK_AT_MARKER["bbox_norm"] = bbox_norm
+        _LOOK_AT_MARKER["timestamp"] = time.monotonic()
+
+
+def _get_look_at_marker(max_age_s: float = 5.0) -> Optional[dict]:
+    with _LOOK_AT_LOCK:
+        ts = _LOOK_AT_MARKER.get("timestamp", 0)
+        if time.monotonic() - ts > max_age_s:
+            return None
+        return dict(_LOOK_AT_MARKER)
 
 
 # --- Preview overlay -------------------------------------------------------
@@ -1293,6 +1512,49 @@ def draw_overlay(
         cv2.putText(
             view, banner, (w - tw - 12, 20 + th),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 220, 0), 2,
+            cv2.LINE_AA,
+        )
+
+    # ---- 5. Look-at object marker -----------------------------------------
+    lam = _get_look_at_marker(max_age_s=5.0)
+    if lam is not None:
+        nx = max(0.0, min(1.0, lam.get("nx", 0.5)))
+        ny = max(0.0, min(1.0, lam.get("ny", 0.5)))
+        lx = int(nx * w)
+        ly = int(ny * h)
+        color = (255, 0, 255)  # magenta in BGR
+        thickness = 2
+
+        # Draw bounding box if available (coords are already mirrored).
+        bbox_norm = lam.get("bbox_norm")
+        if bbox_norm is not None and len(bbox_norm) == 4:
+            bx1 = int(max(0.0, min(1.0, bbox_norm[0])) * w)
+            by1 = int(max(0.0, min(1.0, bbox_norm[1])) * h)
+            bx2 = int(max(0.0, min(1.0, bbox_norm[2])) * w)
+            by2 = int(max(0.0, min(1.0, bbox_norm[3])) * h)
+            cv2.rectangle(view, (bx1, by1), (bx2, by2), color, thickness)
+
+        # Center crosshair.
+        size = 20
+        cv2.line(view, (lx - size, ly), (lx + size, ly), color, thickness + 1)
+        cv2.line(view, (lx, ly - size), (lx, ly + size), color, thickness + 1)
+        cv2.circle(view, (lx, ly), 8, color, 2)
+        label = (
+            f"LOOK: {lam.get('description', '?')} "
+            f"({lam.get('confidence', '?')})"
+        )
+        (tw, th), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1,
+        )
+        ly1 = max(0, ly - size - th - 8)
+        cv2.rectangle(
+            view, (lx - tw // 2 - 4, ly1),
+            (lx + tw // 2 + 4, ly1 + th + 6),
+            color, -1,
+        )
+        cv2.putText(
+            view, label, (lx - tw // 2 + 1, ly1 + th + 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
             cv2.LINE_AA,
         )
 
@@ -1658,6 +1920,9 @@ def main() -> None:
                             identity_graph=identity_graph,
                             gesture_tracker=gesture_tracker,
                             controller=controller,
+                            api_key=api_key,
+                            frame_w=frame_w,
+                            frame_h=frame_h,
                         )
                     model = args.model or os.environ.get("GEMINI_MODEL")
                     if model:
