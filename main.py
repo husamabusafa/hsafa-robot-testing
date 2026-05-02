@@ -1568,6 +1568,9 @@ def main() -> None:
                              "--list-cameras to see which indices work.")
     parser.add_argument("--list-cameras", action="store_true",
                         help="Probe camera indices 0..5 and exit.")
+    parser.add_argument("--reachy-camera", action="store_true",
+                        help="Use the Reachy daemon camera instead of a "
+                             "direct OpenCV camera.")
     parser.add_argument("--no-preview", action="store_true",
                         help="Disable the debug preview window")
     parser.add_argument("--no-body", action="store_true",
@@ -1684,136 +1687,138 @@ def main() -> None:
     gesture_tracker: Optional[GestureTracker] = None
     voice_embedder: Optional[VoiceEmbedder] = None
     voice_identity: Optional[VoiceIdentityWorker] = None
+    lip_tracker = None
 
-    # --- Camera (direct OpenCV, coexists with daemon on macOS) ---------
-    cap = open_camera(args.camera)
-    if cap is None:
-        print(f"Could not open camera index {args.camera}.", file=sys.stderr)
-        print("Tips:", file=sys.stderr)
-        print("  * Run `python main.py --list-cameras` to see which "
-              "indices work.", file=sys.stderr)
-        print("  * If no cameras are listed, grant camera permission to "
-              "your terminal:", file=sys.stderr)
-        print("      System Settings -> Privacy & Security -> Camera -> "
-              "enable for Terminal / iTerm / VSCode,", file=sys.stderr)
-        print("      then fully quit and relaunch the terminal.",
-              file=sys.stderr)
-        sys.exit(1)
+    if not args.reachy_camera:
+        # --- Camera (direct OpenCV, coexists with daemon on macOS) ---------
+        cap = open_camera(args.camera)
+        if cap is None:
+            print(f"Could not open camera index {args.camera}.", file=sys.stderr)
+            print("Tips:", file=sys.stderr)
+            print("  * Run `python main.py --list-cameras` to see which "
+                  "indices work.", file=sys.stderr)
+            print("  * If no cameras are listed, grant camera permission to "
+                  "your terminal:", file=sys.stderr)
+            print("      System Settings -> Privacy & Security -> Camera -> "
+                  "enable for Terminal / iTerm / VSCode,", file=sys.stderr)
+            print("      then fully quit and relaunch the terminal.",
+                  file=sys.stderr)
+            sys.exit(1)
 
-    ok, probe = cap.read()
-    if not ok:
-        print("Camera opened but returned no frame.", file=sys.stderr)
-        sys.exit(1)
-    frame_h, frame_w = probe.shape[:2]
+        ok, probe = cap.read()
+        if not ok:
+            print("Camera opened but returned no frame.", file=sys.stderr)
+            sys.exit(1)
+        frame_h, frame_w = probe.shape[:2]
 
-    enhance = enhance_brightness if args.enhance else (lambda f: f)
-    log.info(
-        "Camera ready: %dx%d (enhance=%s)",
-        frame_w, frame_h, "CLAHE" if args.enhance else "off",
-    )
-    tracker.warmup(frame_h, frame_w)
-    tracker.start()
-
-    # --- Silero VAD (audio speech detector) ----------------------------
-    # Built before the lip-motion tracker so we can hand it the
-    # ``is_active`` callback. If torch / silero isn't installed the
-    # VAD stays disabled and lip-motion falls back to un-gated.
-    if not args.no_vad:
-        audio_vad = SileroVAD(bus=bus, world=world)
-        audio_vad.start()
-
-    # --- Lip-motion speaker tracker ------------------------------------
-    if face_recognizer is not None and not args.no_lip_motion:
-        audio_active_fn = None
-        if audio_vad is not None:
-            audio_active_fn = lambda: audio_vad.is_active  # noqa: E731
-        lip_tracker = LipMotionTracker(
-            recognizer=face_recognizer,
-            get_frame=latest.get_frame,
-            audio_active_fn=audio_active_fn,
-        )
-        lip_tracker.start()
+        enhance = enhance_brightness if args.enhance else (lambda f: f)
         log.info(
-            "Lip-motion speaker tracker enabled (audio-VAD gating=%s).",
-            "on" if audio_active_fn is not None else "off",
+            "Camera ready: %dx%d (enhance=%s)",
+            frame_w, frame_h, "CLAHE" if args.enhance else "off",
         )
+        tracker.warmup(frame_h, frame_w)
+        tracker.start()
 
-    # --- Focus manager --------------------------------------------------
-    focus_manager: Optional[FocusManager] = None
-    if face_recognizer is not None:
-        # Need the cascade tracker to exist; it was started just above.
-        focus_manager = FocusManager(
-            tracker=tracker,
-            lip_tracker=lip_tracker,
-            world=world,
-            bus=bus,
-            frame_w=frame_w,
-            frame_h=frame_h,
-        )
-        log.info("FocusManager enabled (GazePolicy: normal / person, priors).")
+        # --- Silero VAD (audio speech detector) ----------------------------
+        # Built before the lip-motion tracker so we can hand it the
+        # ``is_active`` callback. If torch / silero isn't installed the
+        # VAD stays disabled and lip-motion falls back to un-gated.
+        if not args.no_vad:
+            audio_vad = SileroVAD(bus=bus, world=world)
+            audio_vad.start()
 
-    # --- MediaPipe head-pose tracker -----------------------------------
-    # Stamps each HumanView with yaw/pitch/roll + is_facing_camera so
-    # the GazePolicy can score `is_being_addressed` (see docs/tech-
-    # recommendations.md §1.5).
-    if focus_manager is not None and not args.no_head_pose:
-        head_pose_tracker = HeadPoseTracker(
-            get_frame=latest.get_frame,
-            yolo_tracks=tracker.get_all_tracks,
-            registry=focus_manager.registry,
-        )
-        head_pose_tracker.start()
+        # --- Lip-motion speaker tracker ------------------------------------
+        if face_recognizer is not None and not args.no_lip_motion:
+            audio_active_fn = None
+            if audio_vad is not None:
+                audio_active_fn = lambda: audio_vad.is_active  # noqa: E731
+            lip_tracker = LipMotionTracker(
+                recognizer=face_recognizer,
+                get_frame=latest.get_frame,
+                audio_active_fn=audio_active_fn,
+            )
+            lip_tracker.start()
+            log.info(
+                "Lip-motion speaker tracker enabled (audio-VAD gating=%s).",
+                "on" if audio_active_fn is not None else "off",
+            )
 
-    # --- MediaPipe gesture tracker -------------------------------------
-    if focus_manager is not None and not args.no_gestures:
-        gesture_tracker = GestureTracker(
-            get_frame=latest.get_frame,
-            yolo_tracks=tracker.get_all_tracks,
-            registry=focus_manager.registry,
-            bus=bus,
-        )
-        gesture_tracker.start()
+        # --- Focus manager --------------------------------------------------
+        focus_manager: Optional[FocusManager] = None
+        if face_recognizer is not None:
+            # Need the cascade tracker to exist; it was started just above.
+            focus_manager = FocusManager(
+                tracker=tracker,
+                lip_tracker=lip_tracker,
+                world=world,
+                bus=bus,
+                frame_w=frame_w,
+                frame_h=frame_h,
+            )
+            log.info("FocusManager enabled (GazePolicy: normal / person, priors).")
 
-    # --- Voice identity (speaker ID + cross-modal enrollment) ---------
-    # Requires: VAD (utterance source), face_recognizer (who is
-    # visibly speaking right now) and an identity graph. Any missing
-    # piece disables the whole stack. See docs/identity.md §3 for
-    # the co-occurrence enrollment algorithm.
-    if (
-        audio_vad is not None
-        and identity_graph is not None
-        and lip_tracker is not None
-        and not args.no_voice_id
-    ):
-        voice_embedder = VoiceEmbedder()
+        # --- MediaPipe head-pose tracker -----------------------------------
+        # Stamps each HumanView with yaw/pitch/roll + is_facing_camera so
+        # the GazePolicy can score `is_being_addressed` (see docs/tech-
+        # recommendations.md §1.5).
+        if focus_manager is not None and not args.no_head_pose:
+            head_pose_tracker = HeadPoseTracker(
+                get_frame=latest.get_frame,
+                yolo_tracks=tracker.get_all_tracks,
+                registry=focus_manager.registry,
+            )
+            head_pose_tracker.start()
 
-        def _visible_speaker() -> Optional[str]:
-            """Return the canonical name of a visible + currently-speaking face.
+        # --- MediaPipe gesture tracker -------------------------------------
+        if focus_manager is not None and not args.no_gestures:
+            gesture_tracker = GestureTracker(
+                get_frame=latest.get_frame,
+                yolo_tracks=tracker.get_all_tracks,
+                registry=focus_manager.registry,
+                bus=bus,
+            )
+            gesture_tracker.start()
 
-            Exactly one named face must be speaking; otherwise the
-            enrollment attribution is ambiguous and we return None so
-            the sample gets skipped.
-            """
-            try:
-                names_speaking = [
-                    s.name for s in lip_tracker.snapshot()
-                    if s.is_speaking and s.name
-                ]
-            except Exception:
-                return None
-            if len(names_speaking) != 1:
-                return None
-            return names_speaking[0]
+        # --- Voice identity (speaker ID + cross-modal enrollment) ---------
+        # Requires: VAD (utterance source), face_recognizer (who is
+        # visibly speaking right now) and an identity graph. Any missing
+        # piece disables the whole stack. See docs/identity.md §3 for
+        # the co-occurrence enrollment algorithm.
+        if (
+            audio_vad is not None
+            and identity_graph is not None
+            and lip_tracker is not None
+            and not args.no_voice_id
+        ):
+            voice_embedder = VoiceEmbedder()
 
-        voice_identity = VoiceIdentityWorker(
-            vad=audio_vad,
-            embedder=voice_embedder,
-            identity_graph=identity_graph,
-            world=world,
-            bus=bus,
-            visible_speaker_supplier=_visible_speaker,
-        )
-        voice_identity.start()
+            def _visible_speaker() -> Optional[str]:
+                """Return the canonical name of a visible + currently-speaking face.
+
+                Exactly one named face must be speaking; otherwise the
+                enrollment attribution is ambiguous and we return None so
+                the sample gets skipped.
+                """
+                try:
+                    names_speaking = [
+                        s.name for s in lip_tracker.snapshot()
+                        if s.is_speaking and s.name
+                    ]
+                except Exception:
+                    return None
+                if len(names_speaking) != 1:
+                    return None
+                return names_speaking[0]
+
+            voice_identity = VoiceIdentityWorker(
+                vad=audio_vad,
+                embedder=voice_embedder,
+                identity_graph=identity_graph,
+                world=world,
+                bus=bus,
+                visible_speaker_supplier=_visible_speaker,
+            )
+            voice_identity.start()
 
     # --- Reactive wiring: person_lost -> directed head search ---------
     # The gaze-motion planner (natural_gaze.py) handles the visual
@@ -1856,6 +1861,110 @@ def main() -> None:
                     "daemon without --no-media to enable voice."
                 )
                 args.no_gemini = True
+
+            # --- Reachy daemon camera (deferred setup) --------------------
+            if args.reachy_camera:
+                log.info("Waiting for Reachy camera frame ...")
+                probe = None
+                for _ in range(40):
+                    probe = reachy.media.get_frame()
+                    if probe is not None:
+                        break
+                    time.sleep(0.1)
+                if probe is None:
+                    log.error("Reachy camera: no frame from daemon")
+                    sys.exit(1)
+                frame_h, frame_w = probe.shape[:2]
+                enhance = enhance_brightness if args.enhance else (lambda f: f)
+                log.info(
+                    "Camera ready: %dx%d (enhance=%s)",
+                    frame_w, frame_h, "CLAHE" if args.enhance else "off",
+                )
+                tracker.warmup(frame_h, frame_w)
+                tracker.start()
+
+                if not args.no_vad:
+                    audio_vad = SileroVAD(bus=bus, world=world)
+                    audio_vad.start()
+
+                if face_recognizer is not None and not args.no_lip_motion:
+                    audio_active_fn = None
+                    if audio_vad is not None:
+                        audio_active_fn = lambda: audio_vad.is_active  # noqa: E731
+                    lip_tracker = LipMotionTracker(
+                        recognizer=face_recognizer,
+                        get_frame=latest.get_frame,
+                        audio_active_fn=audio_active_fn,
+                    )
+                    lip_tracker.start()
+                    log.info(
+                        "Lip-motion speaker tracker enabled (audio-VAD gating=%s).",
+                        "on" if audio_active_fn is not None else "off",
+                    )
+
+                if face_recognizer is not None:
+                    focus_manager = FocusManager(
+                        tracker=tracker,
+                        lip_tracker=lip_tracker,
+                        world=world,
+                        bus=bus,
+                        frame_w=frame_w,
+                        frame_h=frame_h,
+                    )
+                    log.info("FocusManager enabled (GazePolicy: normal / person, priors).")
+
+                if focus_manager is not None and not args.no_head_pose:
+                    head_pose_tracker = HeadPoseTracker(
+                        get_frame=latest.get_frame,
+                        yolo_tracks=tracker.get_all_tracks,
+                        registry=focus_manager.registry,
+                    )
+                    head_pose_tracker.start()
+
+                if focus_manager is not None and not args.no_gestures:
+                    gesture_tracker = GestureTracker(
+                        get_frame=latest.get_frame,
+                        yolo_tracks=tracker.get_all_tracks,
+                        registry=focus_manager.registry,
+                        bus=bus,
+                    )
+                    gesture_tracker.start()
+
+                if (
+                    audio_vad is not None
+                    and identity_graph is not None
+                    and lip_tracker is not None
+                    and not args.no_voice_id
+                ):
+                    voice_embedder = VoiceEmbedder()
+
+                    def _visible_speaker() -> Optional[str]:
+                        """Return the canonical name of a visible + currently-speaking face.
+
+                        Exactly one named face must be speaking; otherwise the
+                        enrollment attribution is ambiguous and we return None so
+                        the sample gets skipped.
+                        """
+                        try:
+                            names_speaking = [
+                                s.name for s in lip_tracker.snapshot()
+                                if s.is_speaking and s.name
+                            ]
+                        except Exception:
+                            return None
+                        if len(names_speaking) != 1:
+                            return None
+                        return names_speaking[0]
+
+                    voice_identity = VoiceIdentityWorker(
+                        vad=audio_vad,
+                        embedder=voice_embedder,
+                        identity_graph=identity_graph,
+                        world=world,
+                        bus=bus,
+                        visible_speaker_supplier=_visible_speaker,
+                    )
+                    voice_identity.start()
 
             # --- Mic source that also feeds Silero VAD -----------------
             # Gemini Live polls mic_source; we intercept each chunk and
@@ -1977,7 +2086,11 @@ def main() -> None:
 
             last_log = 0.0
             while not stop["flag"]:
-                ok, frame = cap.read()
+                if args.reachy_camera:
+                    frame = reachy.media.get_frame()
+                    ok = frame is not None
+                else:
+                    ok, frame = cap.read()
                 if not ok or frame is None:
                     # Camera momentarily starved; retry rather than tear down.
                     time.sleep(0.005)
