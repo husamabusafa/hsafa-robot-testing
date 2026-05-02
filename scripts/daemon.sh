@@ -78,10 +78,46 @@ stop_daemon() {
   fi
 }
 
+start_daemon_wireless() {
+  echo "Starting daemon with wireless/IMU support..."
+  if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+    echo "daemon already running (pid $(cat "$PID_FILE"))"
+    return 0
+  fi
+  [[ -x "$BIN" ]] || { echo "Run 'pip install -r requirements.txt' first"; exit 1; }
+  "$BIN" --headless --localhost-only --wireless-version \
+         --log-level INFO --log-file "$LOG_FILE" \
+         > "$OUT_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  PID=$!
+  echo "daemon started with wireless mode (pid $PID)"
+  echo "waiting for motor + media init (port 8000) ..."
+
+  for i in $(seq 1 60); do
+    if ! kill -0 "$PID" 2>/dev/null; then
+      echo "ERROR: daemon process died during startup. Last log lines:"
+      tail -n 30 "$OUT_FILE"
+      rm -f "$PID_FILE"
+      exit 1
+    fi
+    if nc -z localhost 8000 2>/dev/null; then
+      echo "daemon ready after ${i}s"
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "ERROR: daemon did not bind to port 8000 within 60s. Last log lines:"
+  tail -n 30 "$OUT_FILE"
+  exit 1
+}
+
 case "${1:-}" in
   start)   start_daemon ;;
+  start-wireless) start_daemon_wireless ;;
   stop)    stop_daemon ;;
   restart) stop_daemon; sleep 1; start_daemon ;;
+  restart-wireless) stop_daemon; sleep 1; start_daemon_wireless ;;
   status)
     if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       echo "RUNNING (pid $(cat "$PID_FILE"))"
@@ -93,7 +129,16 @@ case "${1:-}" in
     tail -n 100 -f "$OUT_FILE"
     ;;
   *)
-    echo "usage: $0 {start|stop|restart|status|logs}"
+    echo "usage: $0 {start|start-wireless|stop|restart|restart-wireless|status|logs}"
+    echo ""
+    echo "Commands:"
+    echo "  start             - Start daemon (standard mode)"
+    echo "  start-wireless    - Start daemon with IMU/wireless support"
+    echo "  stop              - Stop daemon"
+    echo "  restart           - Restart daemon (standard mode)"
+    echo "  restart-wireless  - Restart daemon with IMU/wireless support"
+    echo "  status            - Check daemon status"
+    echo "  logs              - Tail daemon logs"
     exit 1
     ;;
 esac
