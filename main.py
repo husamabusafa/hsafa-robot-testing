@@ -2177,15 +2177,21 @@ def main() -> None:
                         else:
                             label = tgt or got or "?"
                         focus_tag = f" focus={focus_snap.mode}({label})"
+                    # Add gyro info to log when enabled
+                    gyro_tag = ""
+                    if snap.gyro_compensated:
+                        gyro_tag = f" gyro=({snap.gyro_yaw_rate:+.1f},{snap.gyro_pitch_rate:+.1f})"
+
                     log.info(
                         "tier=%-9s %-4s %-4s err=(%+.2f,%+.2f) "
-                        "yaw=%+6.1f pitch=%+6.1f body=%+6.1f%s",
+                        "yaw=%+6.1f pitch=%+6.1f body=%+6.1f%s%s",
                         snap.tier, tid, mode,
                         snap.err_x, snap.err_y,
                         math.degrees(snap.sent_yaw),
                         math.degrees(snap.sent_pitch),
                         math.degrees(snap.body_yaw),
                         focus_tag,
+                        gyro_tag,
                     )
 
                 # Preview

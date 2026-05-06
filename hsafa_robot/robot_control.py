@@ -28,6 +28,7 @@ from scipy.spatial.transform import Rotation as R
 from .animation import IdleAnimation, TalkingAnimation, blend_offsets
 from .natural_gaze import GazeCommand, MotionProfile, NaturalGaze
 from .tracker import CascadeTracker, TIER_COLORS, TIER_NONE, TrackResult
+from .gyro_stabilizer import GyroStabilizer
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +101,11 @@ class ControlSnapshot:
     body_yaw: float
     antennas: tuple
     talking: bool
+    # Gyro data for debugging
+    gyro_yaw_rate: float = 0.0  # deg/s
+    gyro_pitch_rate: float = 0.0  # deg/s
+    gyro_heading: float = 0.0  # degrees
+    gyro_compensated: bool = False
 
 
 # --- Controller ------------------------------------------------------------
@@ -172,7 +178,17 @@ class RobotController:
             err_x=0.0, err_y=0.0,
             sent_yaw=0.0, sent_pitch=0.0, body_yaw=0.0,
             antennas=(0.0, 0.0), talking=False,
+            gyro_yaw_rate=0.0, gyro_pitch_rate=0.0, gyro_heading=0.0,
+            gyro_compensated=False,
         )
+
+        # Gyro stabilizer for head-motion compensation
+        self._gyro = GyroStabilizer()
+        self._gyro_enabled = self._gyro.start()
+        if self._gyro_enabled:
+            log.info("RobotController: Gyro stabilizer enabled")
+        else:
+            log.warning("RobotController: Gyro stabilizer not available (ESP not connected?)")
 
     # ---- NaturalGaze accessors (for main loop / focus events) ----------
     @property
@@ -188,6 +204,10 @@ class RobotController:
         so the planner can decide saccade vs. smooth pursuit.
         """
         self._natural_gaze.notify_target_changed(new_yaw_rad, new_pitch_rad)
+        # Drop any cached world-frame target on the gyro stabilizer so
+        # we don't EMA across two different people's positions.
+        if self._gyro_enabled:
+            self._gyro.reset()
 
     def notify_person_lost(self, last_known_yaw_rad: float) -> None:
         self._natural_gaze.notify_person_lost(last_known_yaw_rad=last_known_yaw_rad)
@@ -251,6 +271,13 @@ class RobotController:
             current_tier = det.tier
             current_id = det.track_id
             have_face = True
+
+        # ---- 1a. Gyro compensation: subtract head rotation from error ----
+        # When head rotates to track, gyro detects this motion. We compensate
+        # so we track actual target motion, not just visual motion.
+        if self._gyro_enabled and have_face:
+            stab = self._gyro.compensate_head_motion(err_x, err_y, dt)
+            err_x, err_y = stab.err_x, stab.err_y
 
         # ---- 1b. Ask the natural-gaze planner for its preference -------
         # Planner might want to inject a saccade boost, an idle drift
@@ -391,6 +418,19 @@ class RobotController:
             log.warning("set_target failed: %s", e)
 
         # ---- 6. Publish snapshot ----------------------------------------
+        # Get gyro data for debugging
+        gyro_yaw_rate = 0.0
+        gyro_pitch_rate = 0.0
+        gyro_heading = 0.0
+        gyro_compensated = False
+        if self._gyro_enabled:
+            gdata = self._gyro.get_latest()
+            if gdata:
+                gyro_yaw_rate = gdata.gyro_z  # yaw rate from z-axis gyro
+                gyro_pitch_rate = gdata.gyro_y  # pitch rate from y-axis gyro
+                gyro_heading = gdata.heading
+                gyro_compensated = True
+
         self.snapshot = ControlSnapshot(
             tier=current_tier,
             track_id=current_id,
@@ -402,5 +442,9 @@ class RobotController:
             body_yaw=self._body_yaw,
             antennas=tuple(antennas),
             talking=talking,
+            gyro_yaw_rate=gyro_yaw_rate,
+            gyro_pitch_rate=gyro_pitch_rate,
+            gyro_heading=gyro_heading,
+            gyro_compensated=gyro_compensated,
         )
         return self.snapshot
