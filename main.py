@@ -160,8 +160,9 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "`look_up`, `look_down` are convenience presets. "
     "`enable_face_follow()` resumes automatic face tracking; "
     "`disable_face_follow()` freezes the head at its current angle. "
-    "The robot starts with face following DISABLED, so you must call "
-    "`enable_face_follow()` if the user wants you to track them.\n\n"
+    "The robot starts with face following ENABLED -- it will track the "
+    "closest visible person automatically. Use `disable_face_follow()` "
+    "or `set_head_angle(...)` to take manual control.\n\n"
     "You can also look at specific objects in view: "
     "`look_at(description)` uses computer vision to find the described "
     "object (e.g. 'the red cup', 'my phone'), marks its location with "
@@ -2114,37 +2115,9 @@ def main() -> None:
                         tracker.get_all_tracks(),
                         frame_w=frame_w, frame_h=frame_h,
                     )
-                    # Only hint at a saccade when we switch between
-                    # *named* people -- not on every ByteTrack re-ID.
-                    # The P-controller already handles smooth changes
-                    # to an unnamed / moving target naturally.
-                    if (
-                        focus_snap.focused_name is not None
-                        and focus_snap.focused_name != prev_focus_name
-                        and prev_focus_name is not None
-                        and det is not None
-                    ):
-                        # Target yaw ≈ current head yaw + err mapped
-                        # through the camera's half-FOV. 30° is a
-                        # reasonable approximation for a 60° HFOV lens
-                        # (AVFoundation default); off by <20% of jump
-                        # and natural_gaze only cares about whether
-                        # the jump is above its 8° saccade threshold.
-                        half_fov_rad = math.radians(30.0)
-                        approx_yaw = snap.sent_yaw - det.err_x * half_fov_rad
-                        approx_pitch = snap.sent_pitch + det.err_y * half_fov_rad * 0.6
-                        controller.notify_target_switched(
-                            approx_yaw, approx_pitch,
-                        )
                     prev_focus_name = focus_snap.focused_name
                 if lip_tracker is not None:
                     face_snap = lip_tracker.snapshot()
-
-                # Humans seen? -> keep idle drift at bay.
-                if focus_snap is not None and focus_snap.name_by_track:
-                    controller.mark_humans_seen()
-                elif tracker.get_all_tracks():
-                    controller.mark_humans_seen()
 
                 # Publish the robot's own pose into WorldState so any
                 # brain reading the snapshot (Gemini tools / future
@@ -2177,21 +2150,15 @@ def main() -> None:
                         else:
                             label = tgt or got or "?"
                         focus_tag = f" focus={focus_snap.mode}({label})"
-                    # Add gyro info to log when enabled
-                    gyro_tag = ""
-                    if snap.gyro_compensated:
-                        gyro_tag = f" gyro=({snap.gyro_yaw_rate:+.1f},{snap.gyro_pitch_rate:+.1f})"
-
                     log.info(
                         "tier=%-9s %-4s %-4s err=(%+.2f,%+.2f) "
-                        "yaw=%+6.1f pitch=%+6.1f body=%+6.1f%s%s",
+                        "yaw=%+6.1f pitch=%+6.1f body=%+6.1f%s",
                         snap.tier, tid, mode,
                         snap.err_x, snap.err_y,
                         math.degrees(snap.sent_yaw),
                         math.degrees(snap.sent_pitch),
                         math.degrees(snap.body_yaw),
                         focus_tag,
-                        gyro_tag,
                     )
 
                 # Preview

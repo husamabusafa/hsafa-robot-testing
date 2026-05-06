@@ -1,18 +1,25 @@
-"""robot_control.py - Stateful control loop that drives Reachy Mini.
+"""robot_control.py - Simple, natural face-tracking controller for Reachy Mini.
 
-Responsibilities:
+Pipeline (per frame):
 
-* Feed camera frames to :class:`CascadeTracker` and read the latest track.
-* Run a smoothed P-controller on head yaw/pitch to keep the tracked person
-  centered in the image.
-* Rotate the body to extend the effective yaw range when the head is at the
-  edge of its workspace.
-* Overlay one of two animations (idle or talking) on top of the tracking
-  pose and drive the antennas.
-* Send the combined command to ``reachy.set_target`` every tick.
+1. Submit frame to :class:`CascadeTracker` and read latest detection.
+2. Convert normalized image error -> target head angle in world frame
+   (the camera moves with the head, so each tick we ask "where is the
+   target relative to my CURRENT head pose?" and steer toward it).
+3. Slew the head smoothly toward that target with a critically-damped
+   first-order filter -> looks natural, no overshoot, no oscillation.
+4. Engage body yaw only when the head is near its yaw limit so we
+   don't crane the neck.
+5. Overlay idle / talking animation and send the combined target.
 
-Designed so a future Hsafa Core client can inject higher-level pose overrides
-(look-at targets, gestures) without fighting the voice/animation layer.
+Design goals:
+* Predictable, "natural" motion -- no saccades, no idle drift, no
+  search sweeps. Just: see face -> turn toward face -> hold.
+* No gyro feedback. Removed by request; can be re-added later.
+* Manual override (Gemini ``set_head_angle`` / ``look_straight``)
+  takes priority and freezes face-follow until ``clear_manual``.
+* Face-follow is **ON by default** so the robot tracks people right
+  out of the box.
 """
 from __future__ import annotations
 
@@ -26,44 +33,61 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from .animation import IdleAnimation, TalkingAnimation, blend_offsets
-from .natural_gaze import GazeCommand, MotionProfile, NaturalGaze
-from .tracker import CascadeTracker, TIER_COLORS, TIER_NONE, TrackResult
-from .gyro_stabilizer import GyroStabilizer
+from .tracker import CascadeTracker, TIER_NONE, TrackResult
 
 log = logging.getLogger(__name__)
 
 
-# --- Control tuning --------------------------------------------------------
+# --- Geometry / tuning -----------------------------------------------------
 
-# P-controller gains (radians of command per unit of normalized error).
-KP_YAW = 0.6
-KP_PITCH = 0.4
-STEP_SCALE = 0.2
+# Camera field of view (radians). The default AVFoundation/Reachy lens is
+# roughly 60deg horizontal x 45deg vertical. Half-FOV maps a normalized
+# image error of 1.0 to "target sits at the edge of the frame".
+HALF_HFOV = math.radians(30.0)
+HALF_VFOV = math.radians(22.5)
 
-# Flip signs if the robot turns the wrong way. Defaults match the working
-# ``examples/05_face_follow.py`` (raw, un-mirrored image: +x = right, +y =
-# down; +yaw turns left, +pitch looks down).
+# Sign conventions (see examples/05_face_follow.py):
+#   image: +err_x = target on RIGHT, +err_y = target BELOW center
+#   robot: +yaw   = head turns LEFT, +pitch = head looks DOWN
+# So target right (err_x > 0) needs negative yaw, target below
+# (err_y > 0) needs positive pitch.
 YAW_SIGN = -1.0
 PITCH_SIGN = +1.0
 
-# Hardware workspace of the head (radians).
+# Head workspace (radians).
 YAW_LIMIT = math.radians(60)
 PITCH_LIMIT = math.radians(30)
 
-# Small tolerance around center where we don't bother correcting.
-DEADZONE = 0.03
+# How fast we slew the head toward the target each frame. ``ALPHA`` is
+# the per-tick fraction of the remaining error we close. Lower = smoother
+# / less overshoot, higher = snappier. 0.12 gives a ~95% settling time of
+# roughly 0.7 s at 30 FPS.
+ALPHA_YAW = 0.12
+ALPHA_PITCH = 0.12
 
-# EMA smoothing factors in [0, 1]. Higher = snappier, lower = smoother.
-ERR_ALPHA = 0.6
-CMD_ALPHA = 0.4
+# Fraction of the angular offset we *aim for* on each fresh detection.
+# Less than 1.0 because the camera is mounted on the head: by the time
+# the head finishes turning, the target will already be close to the
+# centre of the image, so chasing 100% of the measured offset overshoots.
+LEAD_GAIN = 0.85
 
-# Dropout handling
-COAST_S = 0.6             # keep using last-known error for this long on miss
-RECENTER_AFTER_S = 1.5    # after this long with no face, decay toward center
+# Tiny dead-zone on the normalized image error to avoid micro-jitter
+# when the target is already centered.
+DEADZONE = 0.04
 
-# Body rotation takes over when head yaw exceeds BODY_ENGAGE_RAD.
-BODY_ENGAGE_RAD = math.radians(12)
-BODY_FOLLOW_FRAC = 1.0
+# How long after the last detection we still trust the cached error
+# before we declare the face lost.
+COAST_S = 0.5
+
+# After this long with no face, slowly recenter so the head doesn't sit
+# locked at a stale angle.
+RECENTER_AFTER_S = 2.0
+RECENTER_DECAY = 0.97  # per-tick multiplicative decay toward 0
+
+# Body yaw kicks in once the head crosses this yaw threshold, then
+# follows 1:1 so the head can keep pointing at off-axis targets without
+# hitting its limit.
+BODY_ENGAGE_RAD = math.radians(15)
 BODY_ALPHA = 0.08
 BODY_LIMIT = math.radians(90)
 
@@ -82,7 +106,7 @@ def head_pose(
     return M
 
 
-def clamp(v: float, lo: float, hi: float) -> float:
+def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
@@ -90,7 +114,7 @@ def clamp(v: float, lo: float, hi: float) -> float:
 
 @dataclass
 class ControlSnapshot:
-    """A read-only view of the controller's last tick for logging/UI."""
+    """Read-only view of the controller's last tick (logging / preview)."""
     tier: str
     track_id: Optional[int]
     have_face: bool
@@ -101,30 +125,18 @@ class ControlSnapshot:
     body_yaw: float
     antennas: tuple
     talking: bool
-    # Gyro data for debugging
-    gyro_yaw_rate: float = 0.0  # deg/s
-    gyro_pitch_rate: float = 0.0  # deg/s
-    gyro_heading: float = 0.0  # degrees
+    # Kept for backwards-compat with code that still reads gyro fields;
+    # always zero now that gyro is disabled.
+    gyro_yaw_rate: float = 0.0
+    gyro_pitch_rate: float = 0.0
+    gyro_heading: float = 0.0
     gyro_compensated: bool = False
 
 
 # --- Controller ------------------------------------------------------------
 
 class RobotController:
-    """Drives Reachy Mini given a tracker and an optional speech state.
-
-    Parameters
-    ----------
-    reachy:
-        An open ``ReachyMini`` context (we do NOT manage the connection).
-    tracker:
-        A running :class:`CascadeTracker`.
-    is_talking_fn:
-        Callable returning ``True`` when the robot is currently speaking.
-        Typically ``gemini.is_speaking.is_set``.
-    no_body:
-        If True, never command body yaw.
-    """
+    """Drives Reachy Mini given a tracker and an optional speech state."""
 
     def __init__(
         self,
@@ -142,83 +154,41 @@ class RobotController:
         # Animations
         self._idle = IdleAnimation()
         self._talking = TalkingAnimation()
-        self._anim_blend = 0.0          # 0 = idle, 1 = talking
+        self._anim_blend = 0.0
         self._target_blend = 0.0
 
-        # Natural-gaze motion planner (saccades / micro-saccades /
-        # search / idle drift). All overrides are applied ON TOP of
-        # the P-controller output; the planner itself doesn't move
-        # motors.
-        self._natural_gaze = NaturalGaze()
-        self._last_locked_id: Optional[int] = None
-        self._last_humans_seen_ts = time.time()
-
-        # Face-tracking state
-        self._cmd_yaw = 0.0
-        self._cmd_pitch = 0.0
+        # Head state (radians, head frame, before animation overlay).
         self._sent_yaw = 0.0
         self._sent_pitch = 0.0
-        self._err_x_s = 0.0
-        self._err_y_s = 0.0
         self._body_yaw = 0.0
-        self._last_seen = 0.0
+
+        # World-frame target the head is currently slewing toward.
+        # Only updated when a fresh detection arrives so stale ticks
+        # don't accumulate overshoot.
+        self._target_yaw = 0.0
+        self._target_pitch = 0.0
+
+        # Last detection for fresh-vs-stale comparison + coasting.
+        self._last_err_x = 0.0
+        self._last_err_y = 0.0
         self._last_det_ts = 0.0
+        self._last_seen = 0.0
         self._last_tick = time.time()
 
-        # Manual head override (when Gemini or user takes direct control).
-        # Start in manual mode so the robot does NOT auto-follow faces.
-        self._manual_override = True
+        # Manual override -- face follow is ON by default.
+        self._manual_override = False
         self._manual_yaw = 0.0
         self._manual_pitch = 0.0
         self._manual_body_yaw = 0.0
 
-        # Public snapshot for logging / preview
         self.snapshot = ControlSnapshot(
             tier=TIER_NONE, track_id=None, have_face=False,
             err_x=0.0, err_y=0.0,
             sent_yaw=0.0, sent_pitch=0.0, body_yaw=0.0,
             antennas=(0.0, 0.0), talking=False,
-            gyro_yaw_rate=0.0, gyro_pitch_rate=0.0, gyro_heading=0.0,
-            gyro_compensated=False,
         )
 
-        # Gyro stabilizer for head-motion compensation
-        self._gyro = GyroStabilizer()
-        self._gyro_enabled = self._gyro.start()
-        if self._gyro_enabled:
-            log.info("RobotController: Gyro stabilizer enabled")
-        else:
-            log.warning("RobotController: Gyro stabilizer not available (ESP not connected?)")
-
-    # ---- NaturalGaze accessors (for main loop / focus events) ----------
-    @property
-    def natural_gaze(self) -> NaturalGaze:
-        return self._natural_gaze
-
-    def notify_target_switched(
-        self, new_yaw_rad: float, new_pitch_rad: float,
-    ) -> None:
-        """Let the gaze planner know the gaze target just switched.
-
-        Pass the approximate yaw/pitch the head will be aimed at next
-        so the planner can decide saccade vs. smooth pursuit.
-        """
-        self._natural_gaze.notify_target_changed(new_yaw_rad, new_pitch_rad)
-        # Drop any cached world-frame target on the gyro stabilizer so
-        # we don't EMA across two different people's positions.
-        if self._gyro_enabled:
-            self._gyro.reset()
-
-    def notify_person_lost(self, last_known_yaw_rad: float) -> None:
-        self._natural_gaze.notify_person_lost(last_known_yaw_rad=last_known_yaw_rad)
-
-    def notify_voice_unseen(self, guess_yaw_rad: Optional[float] = None) -> None:
-        self._natural_gaze.notify_voice_unseen(guess_yaw_rad=guess_yaw_rad)
-
-    def cue_listener_glance(self, other_person_yaw_rad: float) -> None:
-        self._natural_gaze.cue_listener_glance(other_person_yaw_rad)
-
-    # ---- Manual head override ------------------------------------------
+    # ---- Manual override ------------------------------------------------
     def set_manual_target(
         self,
         yaw_deg: float = 0.0,
@@ -240,151 +210,107 @@ class RobotController:
         return self._manual_override
 
     def mark_humans_seen(self) -> None:
-        """Called by the main loop while at least one human is visible."""
-        self._last_humans_seen_ts = time.time()
+        """No-op kept for API compatibility with the previous controller."""
 
-    # ---- per-frame tick -------------------------------------------------
+    # ---- Backwards-compat no-op hooks -----------------------------------
+    # The old NaturalGaze planner had a bunch of "I lost the person",
+    # "I switched targets", "I heard a voice off-camera" entry points.
+    # Those behaviors caused the unnatural saccades / drift the user
+    # reported, so they're gone. Callers in main.py still invoke them
+    # via the event bus, hence the no-op stubs.
+    def notify_target_switched(self, *_args, **_kwargs) -> None:  # noqa: D401
+        return None
+
+    def notify_person_lost(self, *_args, **_kwargs) -> None:
+        return None
+
+    def notify_voice_unseen(self, *_args, **_kwargs) -> None:
+        return None
+
+    def cue_listener_glance(self, *_args, **_kwargs) -> None:
+        return None
+
+    # ---- Per-frame tick -------------------------------------------------
     def tick(self, frame) -> ControlSnapshot:
         """Advance the controller by one frame and command the robot."""
         now = time.time()
         dt = max(1e-3, now - self._last_tick)
         self._last_tick = now
 
-        # ---- 1. Submit frame & read latest detection --------------------
+        # ---- 1. Latest detection ---------------------------------------
         self.tracker.submit(frame)
         det: Optional[TrackResult] = self.tracker.get()
 
         have_face = False
         err_x = err_y = 0.0
-        current_tier = TIER_NONE
-        current_id: Optional[int] = None
+        tier = TIER_NONE
+        tid: Optional[int] = None
+        fresh = False
 
-        if det is not None and det.timestamp != self._last_det_ts:
-            err_x, err_y = det.err_x, det.err_y
-            current_tier = det.tier
-            current_id = det.track_id
-            have_face = True
-            self._last_seen = det.timestamp
-            self._last_det_ts = det.timestamp
-        elif det is not None and (now - det.timestamp) < COAST_S:
-            err_x, err_y = det.err_x, det.err_y
-            current_tier = det.tier
-            current_id = det.track_id
-            have_face = True
+        if det is not None:
+            if det.timestamp != self._last_det_ts:
+                # New measurement from the tracker -- one we haven't
+                # acted on yet.
+                fresh = True
+                self._last_err_x = det.err_x
+                self._last_err_y = det.err_y
+                self._last_det_ts = det.timestamp
+                self._last_seen = det.timestamp
+            if (now - det.timestamp) < COAST_S:
+                err_x = self._last_err_x
+                err_y = self._last_err_y
+                tier = det.tier
+                tid = det.track_id
+                have_face = True
 
-        # ---- 1a. Gyro compensation: subtract head rotation from error ----
-        # When head rotates to track, gyro detects this motion. We compensate
-        # so we track actual target motion, not just visual motion.
-        if self._gyro_enabled and have_face:
-            stab = self._gyro.compensate_head_motion(err_x, err_y, dt)
-            err_x, err_y = stab.err_x, stab.err_y
-
-        # ---- 1b. Ask the natural-gaze planner for its preference -------
-        # Planner might want to inject a saccade boost, an idle drift
-        # override, a search sweep, or just pass through.
-        no_humans_s = max(0.0, now - self._last_humans_seen_ts)
-        gcmd: GazeCommand = self._natural_gaze.tick(
-            have_target=have_face,
-            current_yaw=self._cmd_yaw,
-            current_pitch=self._cmd_pitch,
-            no_humans_s=no_humans_s,
-        )
-
-        # ---- 2. Error smoothing & P-controller --------------------------
-        # If manual override is active, skip face tracking and drive
-        # directly toward the commanded angles.
+        # ---- 2. Decide world-frame target ------------------------------
+        # Only re-aim on a *fresh* detection. Between detections we keep
+        # slewing toward the previously-computed target so stale-error
+        # ticks can't push the head past it (this is what was causing
+        # the head to swing wildly back and forth).
         if self._manual_override:
-            self._cmd_yaw += (
-                KP_YAW * (self._manual_yaw - self._cmd_yaw) * STEP_SCALE
+            self._target_yaw = self._manual_yaw
+            self._target_pitch = self._manual_pitch
+            target_body = self._manual_body_yaw
+        elif fresh and have_face:
+            # Camera is on the head, so err already includes the robot's
+            # own motion. ``LEAD_GAIN < 1`` keeps us slightly under-shooting
+            # the measured offset so we don't blow past the target while
+            # the head is still moving.
+            ex = err_x if abs(err_x) > DEADZONE else 0.0
+            ey = err_y if abs(err_y) > DEADZONE else 0.0
+            self._target_yaw = _clamp(
+                self._sent_yaw + YAW_SIGN * ex * HALF_HFOV * LEAD_GAIN,
+                -YAW_LIMIT, YAW_LIMIT,
             )
-            self._cmd_pitch += (
-                KP_PITCH * (self._manual_pitch - self._cmd_pitch) * STEP_SCALE
+            self._target_pitch = _clamp(
+                self._sent_pitch + PITCH_SIGN * ey * HALF_VFOV * LEAD_GAIN,
+                -PITCH_LIMIT, PITCH_LIMIT,
             )
-            self._body_yaw += (
-                BODY_ALPHA * (self._manual_body_yaw - self._body_yaw)
-            )
-            self._err_x_s = 0.0
-            self._err_y_s = 0.0
-            was_moving = (
-                abs(self._cmd_yaw - self._manual_yaw) > DEADZONE
-                or abs(self._cmd_pitch - self._manual_pitch) > DEADZONE
-            )
+            target_body = self._compute_body_target(self._target_yaw)
+        elif have_face:
+            # Stale tick: keep slewing toward the target we already had.
+            target_body = self._compute_body_target(self._target_yaw)
         else:
-            if have_face:
-                self._err_x_s = (1 - ERR_ALPHA) * self._err_x_s + ERR_ALPHA * err_x
-                self._err_y_s = (1 - ERR_ALPHA) * self._err_y_s + ERR_ALPHA * err_y
+            # No face: hold for a grace period, then drift back to centre.
+            if (now - self._last_seen) > RECENTER_AFTER_S:
+                self._target_yaw *= RECENTER_DECAY
+                self._target_pitch *= RECENTER_DECAY
+            target_body = self._compute_body_target(self._target_yaw)
 
-            # Track whether the controller is actively moving (for micro-
-            # saccade bookkeeping).
-            was_moving = (
-                abs(self._err_x_s) > DEADZONE or abs(self._err_y_s) > DEADZONE
-            )
+        # ---- 3. Smooth slew -------------------------------------------
+        self._sent_yaw += ALPHA_YAW * (self._target_yaw - self._sent_yaw)
+        self._sent_pitch += ALPHA_PITCH * (self._target_pitch - self._sent_pitch)
+        self._sent_yaw = _clamp(self._sent_yaw, -YAW_LIMIT, YAW_LIMIT)
+        self._sent_pitch = _clamp(self._sent_pitch, -PITCH_LIMIT, PITCH_LIMIT)
 
-        # Gain scale from the planner -- saccades multiply KP for a
-        # ballistic snap; idle drift uses gain 1.0 because it overrides
-        # the target directly.
-        gain = max(0.2, gcmd.gain_scale)
+        # Body yaw with its own (slower) low-pass.
+        self._body_yaw += BODY_ALPHA * (target_body - self._body_yaw)
+        self._body_yaw = float(_clamp(self._body_yaw, -BODY_LIMIT, BODY_LIMIT))
 
-        active = have_face or (now - self._last_seen) < COAST_S
-        if gcmd.override_yaw is not None or gcmd.override_pitch is not None:
-            # Absolute override path (idle drift / search / listener glance)
-            # -- ignore P-controller entirely for the overridden axis.
-            if gcmd.override_yaw is not None:
-                target_yaw = gcmd.override_yaw
-                self._cmd_yaw += gain * KP_YAW * (target_yaw - self._cmd_yaw) * STEP_SCALE
-            if gcmd.override_pitch is not None:
-                target_pitch = gcmd.override_pitch
-                self._cmd_pitch += (
-                    gain * KP_PITCH * (target_pitch - self._cmd_pitch) * STEP_SCALE
-                )
-        elif active:
-            if abs(self._err_x_s) > DEADZONE:
-                self._cmd_yaw += (
-                    YAW_SIGN * KP_YAW * self._err_x_s * STEP_SCALE * gain
-                )
-            if abs(self._err_y_s) > DEADZONE:
-                self._cmd_pitch += (
-                    PITCH_SIGN * KP_PITCH * self._err_y_s * STEP_SCALE * gain
-                )
-        elif now - self._last_seen > RECENTER_AFTER_S:
-            self._err_x_s *= 0.9
-            self._err_y_s *= 0.9
-            self._cmd_yaw *= 0.95
-            self._cmd_pitch *= 0.95
-
-        # Bookkeeping for the planner so micro-saccades know when to
-        # fire.
-        if was_moving:
-            self._natural_gaze.note_motion_active()
-        else:
-            self._natural_gaze.note_motion_settled(now)
-
-        self._cmd_yaw = clamp(self._cmd_yaw, -YAW_LIMIT, YAW_LIMIT)
-        self._cmd_pitch = clamp(self._cmd_pitch, -PITCH_LIMIT, PITCH_LIMIT)
-
-        self._sent_yaw = (
-            (1 - CMD_ALPHA) * self._sent_yaw + CMD_ALPHA * self._cmd_yaw
-        )
-        self._sent_pitch = (
-            (1 - CMD_ALPHA) * self._sent_pitch + CMD_ALPHA * self._cmd_pitch
-        )
-
-        # ---- 3. Body yaw ------------------------------------------------
-        if self.no_body:
-            body_target = 0.0
-        elif self._cmd_yaw > BODY_ENGAGE_RAD:
-            body_target = (self._cmd_yaw - BODY_ENGAGE_RAD) * BODY_FOLLOW_FRAC
-        elif self._cmd_yaw < -BODY_ENGAGE_RAD:
-            body_target = (self._cmd_yaw + BODY_ENGAGE_RAD) * BODY_FOLLOW_FRAC
-        else:
-            body_target = 0.0
-        self._body_yaw = (1 - BODY_ALPHA) * self._body_yaw + BODY_ALPHA * body_target
-        self._body_yaw = float(clamp(self._body_yaw, -BODY_LIMIT, BODY_LIMIT))
-
-        # ---- 4. Animation overlay ---------------------------------------
+        # ---- 4. Animation overlay --------------------------------------
         talking = bool(self.is_talking_fn())
         self._target_blend = 1.0 if talking else 0.0
-        # Exponential crossfade so transitions never snap.
         blend_step = dt / ANIM_CROSSFADE_S
         if self._anim_blend < self._target_blend:
             self._anim_blend = min(self._target_blend, self._anim_blend + blend_step)
@@ -395,18 +321,18 @@ class RobotController:
         talk_off = self._talking.offsets(now)
         off = blend_offsets(idle_off, talk_off, self._anim_blend)
 
-        # ---- 5. Compose & send ------------------------------------------
         head_roll = off["roll"]
-        head_pitch = self._sent_pitch + off["pitch"] + gcmd.offset_pitch
-        head_yaw = self._sent_yaw + off["yaw"] + gcmd.offset_yaw
-
-        # Clamp final commanded angles to stay inside the head workspace.
-        head_pitch = clamp(head_pitch, -PITCH_LIMIT, PITCH_LIMIT)
-        head_yaw = clamp(head_yaw, -YAW_LIMIT, YAW_LIMIT)
+        head_pitch = _clamp(
+            self._sent_pitch + off["pitch"], -PITCH_LIMIT, PITCH_LIMIT,
+        )
+        head_yaw = _clamp(
+            self._sent_yaw + off["yaw"], -YAW_LIMIT, YAW_LIMIT,
+        )
 
         right_ant, left_ant = off["antennas"]
         antennas = [float(right_ant), float(left_ant)]
 
+        # ---- 5. Send ---------------------------------------------------
         try:
             self.reachy.set_target(
                 head=head_pose(roll=head_roll, pitch=head_pitch, yaw=head_yaw),
@@ -414,37 +340,29 @@ class RobotController:
                 antennas=antennas,
             )
         except Exception as e:
-            # Don't let a transient set_target hiccup kill the loop.
             log.warning("set_target failed: %s", e)
 
-        # ---- 6. Publish snapshot ----------------------------------------
-        # Get gyro data for debugging
-        gyro_yaw_rate = 0.0
-        gyro_pitch_rate = 0.0
-        gyro_heading = 0.0
-        gyro_compensated = False
-        if self._gyro_enabled:
-            gdata = self._gyro.get_latest()
-            if gdata:
-                gyro_yaw_rate = gdata.gyro_z  # yaw rate from z-axis gyro
-                gyro_pitch_rate = gdata.gyro_y  # pitch rate from y-axis gyro
-                gyro_heading = gdata.heading
-                gyro_compensated = True
-
+        # ---- 6. Snapshot ----------------------------------------------
         self.snapshot = ControlSnapshot(
-            tier=current_tier,
-            track_id=current_id,
+            tier=tier,
+            track_id=tid,
             have_face=have_face,
-            err_x=self._err_x_s,
-            err_y=self._err_y_s,
+            err_x=err_x,
+            err_y=err_y,
             sent_yaw=self._sent_yaw,
             sent_pitch=self._sent_pitch,
             body_yaw=self._body_yaw,
             antennas=tuple(antennas),
             talking=talking,
-            gyro_yaw_rate=gyro_yaw_rate,
-            gyro_pitch_rate=gyro_pitch_rate,
-            gyro_heading=gyro_heading,
-            gyro_compensated=gyro_compensated,
         )
         return self.snapshot
+
+    # ---- Helpers --------------------------------------------------------
+    def _compute_body_target(self, head_yaw: float) -> float:
+        if self.no_body:
+            return 0.0
+        if head_yaw > BODY_ENGAGE_RAD:
+            return head_yaw - BODY_ENGAGE_RAD
+        if head_yaw < -BODY_ENGAGE_RAD:
+            return head_yaw + BODY_ENGAGE_RAD
+        return 0.0
