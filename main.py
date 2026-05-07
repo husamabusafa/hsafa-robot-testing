@@ -63,6 +63,7 @@ from reachy_mini import ReachyMini
 
 LOOK_AT_MODEL = "qwen/qwen3-vl-8b-instruct"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 from hsafa_robot.audio_vad import SileroVAD
 from hsafa_robot.events import (
     EVT_GESTURE_DETECTED,
@@ -72,16 +73,7 @@ from hsafa_robot.events import (
     EVT_VOICE_UNSEEN,
     EventBus,
 )
-from hsafa_robot.face_db import FaceDB, canonicalize_name
-from hsafa_robot.face_recognizer import FaceRecognizer
-from hsafa_robot.focus import FocusManager, FocusSnapshot
-from hsafa_robot.gaze_policy import GazePrior
 from hsafa_robot.gemini_live import GeminiLiveSession
-from hsafa_robot.gestures import GestureTracker
-from hsafa_robot.head_pose import HeadPoseTracker
-from hsafa_robot.object_detector import ObjectDetector
-from hsafa_robot.identity_graph import IdentityGraph
-from hsafa_robot.lip_motion import LipMotionTracker
 from hsafa_robot.robot_control import RobotController, head_pose
 from hsafa_robot.tracker import (
     CascadeTracker,
@@ -91,9 +83,60 @@ from hsafa_robot.tracker import (
     ensure_pose_model,
     pick_device,
 )
-from hsafa_robot.voice_embedder import VoiceEmbedder
-from hsafa_robot.voice_identity import VoiceIdentityWorker
 from hsafa_robot.world_state import WorldStateHolder
+
+# Optional modules (archived for minimal build)
+try:
+    from hsafa_robot.face_db import FaceDB, canonicalize_name
+except ImportError:
+    FaceDB = None
+    canonicalize_name = None
+
+try:
+    from hsafa_robot.face_recognizer import FaceRecognizer
+except ImportError:
+    FaceRecognizer = None
+
+try:
+    from hsafa_robot.focus import FocusManager, FocusSnapshot
+except ImportError:
+    FocusManager = None
+    FocusSnapshot = None
+
+try:
+    from hsafa_robot.gestures import GestureTracker
+except ImportError:
+    GestureTracker = None
+
+try:
+    from hsafa_robot.head_pose import HeadPoseTracker
+except ImportError:
+    HeadPoseTracker = None
+
+try:
+    from hsafa_robot.object_detector import ObjectDetector
+except ImportError:
+    ObjectDetector = None
+
+try:
+    from hsafa_robot.identity_graph import IdentityGraph
+except ImportError:
+    IdentityGraph = None
+
+try:
+    from hsafa_robot.lip_motion import LipMotionTracker
+except ImportError:
+    LipMotionTracker = None
+
+try:
+    from hsafa_robot.voice_embedder import VoiceEmbedder
+except ImportError:
+    VoiceEmbedder = None
+
+try:
+    from hsafa_robot.voice_identity import VoiceIdentityWorker
+except ImportError:
+    VoiceIdentityWorker = None
 
 log = logging.getLogger("hsafa_robot.main")
 

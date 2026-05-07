@@ -1,6 +1,6 @@
-# Tech Stack — main.py
+# Tech Stack — main.py (Minimal)
 
-This document lists every technology, library, model, and external service used by `main.py` (and the modules it imports from `hsafa_robot/`).
+This document lists the technologies used by the **lean** version of `main.py`.  Heavy optional modules (face recognition, gestures, head-pose, voice identity) have been moved to `archive/` and are no longer imported at startup.
 
 ---
 
@@ -17,8 +17,7 @@ This document lists every technology, library, model, and external service used 
 | Library | Usage |
 |---------|-------|
 | `asyncio` | Async event loop for Gemini Live session. |
-| `threading` | Background tracker, VAD, lip-motion, and gesture threads. |
-| `pathlib` | Data directory paths (`data/faces`, `data/identity`). |
+| `threading` | Background tracker and VAD threads. |
 | `logging` | Structured runtime logging. |
 | `signal` | Graceful shutdown (`SIGINT`). |
 | `json`, `re`, `base64`, `math`, `time` | Data parsing, regex, image encoding, geometry, timestamps. |
@@ -30,75 +29,69 @@ This document lists every technology, library, model, and external service used 
 | Library / Model | Version | Usage |
 |-----------------|---------|-------|
 | **OpenCV** (`opencv-python`) | `>=4.9` | Raw camera capture (AVFoundation on macOS), frame preprocessing, drawing overlays. |
-| **Ultralytics YOLO** (`ultralytics`) | `>=8.3` | `YOLOv8n-Pose` — person detection + 17 COCO keypoints (nose, eyes, shoulders, etc.). |
+| **Ultralytics YOLO** (`ultralytics`) | `>=8.3` | `YOLOv8n-Pose` — person detection + 17 COCO keypoints. |
 | **ByteTrack** | bundled | Multi-object tracking by detection; assigns stable IDs across frames. |
 | **Kalman filter** | bundled | Predicts bbox motion between frames for smooth tracking. |
 | **MOG2** (OpenCV) | bundled | Background-subtraction fallback when YOLO misses the target. |
-| **MediaPipe** (`mediapipe`) | `>=0.10` | Face-mesh landmarks for head-pose estimation (yaw/pitch/roll + `is_facing_camera`). Hand landmarks for gesture recognition (wave, point, thumbs-up, open-palm, fist). |
 
 ---
 
-## 4. Face Recognition & Identity
+## 4. Voice & Audio
 
 | Library / Model | Version | Usage |
 |-----------------|---------|-------|
-| **facenet-pytorch** | `>=2.5` | `MTCNN` (face detection + alignment) → `InceptionResnetV1` (512-D embedding, VGGFace2 weights). |
-| **PyTorch** (`torch`) | implicit | Runs FaceNet, Silero VAD, and SpeechBrain models on CPU. |
-| **Pillow** (`PIL`) | `>=10.0` | Image format conversion for FaceNet pipeline. |
-| **FaceDB** (`hsafa_robot.face_db`) | custom | SQLite-backed L2-normalized embedding store + cosine-nearest-neighbor identity search. |
-| **IdentityGraph** (`hsafa_robot.identity_graph`) | custom | Links face names ↔ voice embeddings ↔ spatial history into a unified person record. |
-
----
-
-## 5. Voice & Audio
-
-| Library / Model | Version | Usage |
-|-----------------|---------|-------|
-| **Silero VAD** (`silero-vad`) | `>=5.0` | Determines whether microphone audio contains human speech (gates lip-motion false-positives). |
-| **SpeechBrain** + **torchaudio** | `>=1.0` / `>=2.0` | `ECAPA-TDNN` speaker-embedding model for voice identity / voice-print enrollment. |
+| **Silero VAD** (`silero-vad`) | `>=5.0` | Determines whether microphone audio contains human speech. |
 | **GStreamer** | system | Reachy `MediaManager` uses GStreamer for device selection, channel duplication, and 24 kHz → 16 kHz resampling. |
 
 ---
 
-## 6. AI / LLM APIs
+## 5. AI / LLM APIs
 
-| Service / SDK | Model | Usage |
-|---------------|-------|-------|
-| **Google GenAI** (`google-genai`) | `>=1.70` | Gemini Live API — bidirectional voice + vision streaming. The robot hears, sees, and speaks through this session. |
-| **OpenAI SDK** (`openai`) | `>=1.0` | Client for **OpenRouter** (`https://openrouter.ai/api/v1`). Calls `qwen/qwen3-vl-8b-instruct` for object-localization when the user says "look at the X". |
+| Service / SDK | Version | Usage |
+|---------------|---------|-------|
+| **Google GenAI** (`google-genai`) | `>=1.70` | Gemini Live API — bidirectional voice + vision streaming. |
 
 ---
 
-## 7. Motion Control
+## 6. Motion Control
 
 | Module | Role |
 |--------|------|
-| `hsafa_robot.robot_control` | P-controller that maps normalized image error → head angles (world-frame). Body yaw engages when head nears limit. |
-| `hsafa_robot.animation` | Idle + talking head-motion overlays (breathing / nod) blended via cross-fade. |
+| `hsafa_robot.robot_control` | P-controller that maps normalized image error → head angles. Body yaw engages when head nears limit. |
+| `hsafa_robot.animation` | Idle + talking head-motion overlays blended via cross-fade. |
 | `scipy.spatial.transform.Rotation` | `>=1.13` — quaternion / Euler conversions for head-pose math. |
 
 ---
 
-## 8. Perception & State Modules (custom)
+## 7. Active Modules (custom)
 
 | Module | Layer | Role |
 |--------|-------|------|
 | `tracker` | L1 | CascadeTracker thread (YOLO + ByteTrack + Kalman + MOG2). |
-| `face_recognizer` | L1 | MTCNN + FaceNet enroll / identify pipeline. |
-| `lip_motion` | L1 | Mouth-region optical-flow tracker (Lukas-Kanade) gated by VAD. |
 | `audio_vad` | L1 | Silero VAD speech-detection thread. |
-| `head_pose` | L1 | MediaPipe face-mesh → yaw/pitch/roll + `is_facing_camera`. |
-| `gestures` | L1 | MediaPipe hand landmarks → gesture classification + pointing vector. |
-| `object_detector` | L1 | YOLO object detection for held-item tagging. |
-| `voice_embedder` | L1 | SpeechBrain ECAPA-TDNN voice-print extraction. |
-| `perception` | L1/L2 | `HumanRegistry` — links face bboxes ↔ body bboxes ↔ keypoints. |
 | `events` | L2 | `EventBus` — typed pub/sub for cross-module communication. |
 | `world_state` | L2 | `WorldStateHolder` — canonical snapshot of who/where/what in the scene. |
-| `gaze_policy` | L2 | Scoring engine that decides who the robot should look at (proximity, speaker, gesture, familiarity). |
-| `focus` | L2 | `FocusManager` — drives `GazePolicy` scores into concrete head/body targets. |
-| `identity_graph` | L2 | Persistent graph linking face ↔ voice ↔ name across sessions. |
-| `voice_identity` | L2 | `VoiceIdentityWorker` — matches voice-prints to enrolled identities. |
-| `gemini_live` | L3 | `GeminiLiveSession` — async WebSocket to Gemini Live; handles audio in, audio out, and vision frames. |
+| `gemini_live` | L3 | `GeminiLiveSession` — async WebSocket to Gemini Live. |
+| `robot_control` | L0 | Head/body motion controller. |
+| `animation` | L0 | Idle / talking animation overlays. |
+
+---
+
+## 8. Archived Modules (in `archive/hsafa_robot/`)
+
+These modules were removed from the active stack to reduce dependencies and startup weight. They can be restored later if needed.
+
+| Module | Why Archived | Heavy Dependencies |
+|--------|-----------|-------------------|
+| `face_db`, `face_recognizer` | Face enrollment / identification | `facenet-pytorch`, `Pillow`, `torch` |
+| `focus`, `gaze_policy`, `perception` | Gaze scoring & focus management | `mediapipe` (via head_pose, gestures) |
+| `gestures`, `head_pose`, `object_detector` | MediaPipe hands / face-mesh | `mediapipe` |
+| `lip_motion` | Mouth optical-flow speaker detection | `mediapipe` (via face mesh) |
+| `identity_graph` | Cross-modal face+voice linking | `facenet-pytorch`, `speechbrain` |
+| `voice_embedder`, `voice_identity` | Speaker recognition by voice-print | `speechbrain`, `torchaudio` |
+| `natural_gaze` | Saccades / idle drift / search | `mediapipe` |
+| `esp_gyro_bridge`, `gyro_stabilizer`, `head_gyro` | Gyro-based stabilization | hardware-specific |
+| `voice_recognizer` | Legacy voice recognition stub | — |
 
 ---
 
@@ -106,9 +99,7 @@ This document lists every technology, library, model, and external service used 
 
 | File | Purpose |
 |------|---------|
-| `.env` | Runtime secrets (`GEMINI_API_KEY`, `OPENROUTER_API_KEY`). |
-| `data/faces/` | SQLite + image cache for enrolled face embeddings. |
-| `data/identity/` | JSON/graph store for `IdentityGraph`. |
+| `.env` | Runtime secrets (`GEMINI_API_KEY`). |
 | `models/yolov8n-pose.pt` | YOLOv8-Pose weights (auto-downloaded on first run). |
 
 ---
@@ -122,14 +113,8 @@ scipy>=1.13
 opencv-python>=4.9
 ultralytics>=8.3
 google-genai>=1.70
-openai>=1.0
 python-dotenv>=1.0
-facenet-pytorch>=2.5
-Pillow>=10.0
-mediapipe>=0.10
 silero-vad>=5.0
-speechbrain>=1.0
-torchaudio>=2.0
 ```
 
-(Implicit: `torch`, `torchvision`, `onnxruntime` where required by above packages.)
+(Implicit: `torch` pulled in by `silero-vad` only — much smaller than the full FaceNet + SpeechBrain stack.)
