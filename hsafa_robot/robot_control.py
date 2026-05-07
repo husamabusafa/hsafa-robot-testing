@@ -71,6 +71,19 @@ ALPHA_PITCH = 0.12
 # centre of the image, so chasing 100% of the measured offset overshoots.
 LEAD_GAIN = 0.85
 
+# When a fresh detection implies a *large* angular jump (target moved
+# far -- new person, look-at switch, sudden movement), boost the slew
+# rate for that one tick so the head snaps over quickly, then settles
+# back to the smooth ALPHA. Mimics human saccade-then-fixate.
+SACCADE_JUMP_RAD = math.radians(8)
+ALPHA_SACCADE = 0.4
+
+# How long a *temporary* manual gaze (look_at / look_left / look_right /
+# look_up / look_down / set_head_angle) holds before automatically
+# returning to face-follow. ``disable_face_follow`` is the only call
+# that locks the head indefinitely.
+AUTO_RESUME_S = 2.5
+
 # Tiny dead-zone on the normalized image error to avoid micro-jitter
 # when the target is already centered.
 DEADZONE = 0.04
@@ -175,11 +188,15 @@ class RobotController:
         self._last_seen = 0.0
         self._last_tick = time.time()
 
-        # Manual override -- face follow is ON by default.
+        # Manual override -- face follow is ON by default. ``_manual_until``
+        # is a unix timestamp; if non-zero, we automatically return to
+        # face-follow once we pass it. ``disable_face_follow`` sets it to
+        # +inf for an indefinite hold.
         self._manual_override = False
         self._manual_yaw = 0.0
         self._manual_pitch = 0.0
         self._manual_body_yaw = 0.0
+        self._manual_until = 0.0
 
         self.snapshot = ControlSnapshot(
             tier=TIER_NONE, track_id=None, have_face=False,
@@ -194,16 +211,30 @@ class RobotController:
         yaw_deg: float = 0.0,
         pitch_deg: float = 0.0,
         body_yaw_deg: float = 0.0,
+        *,
+        hold_s: Optional[float] = AUTO_RESUME_S,
     ) -> None:
-        """Lock head (and optionally body) to fixed angles; disable face tracking."""
+        """Aim head/body at fixed angles, suppressing face follow.
+
+        ``hold_s`` is how long the manual pose is held before face
+        follow automatically resumes. The default mimics a human
+        glance: look at the thing for ~2.5 s, then return to whoever
+        you were talking to. Pass ``hold_s=None`` for an indefinite
+        lock (used by ``disable_face_follow``).
+        """
         self._manual_override = True
         self._manual_yaw = math.radians(float(yaw_deg))
         self._manual_pitch = math.radians(float(pitch_deg))
         self._manual_body_yaw = math.radians(float(body_yaw_deg))
+        if hold_s is None:
+            self._manual_until = float("inf")
+        else:
+            self._manual_until = time.time() + float(hold_s)
 
     def clear_manual(self) -> None:
         """Return to automatic face-tracking mode."""
         self._manual_override = False
+        self._manual_until = 0.0
 
     @property
     def is_manual(self) -> bool:
@@ -268,10 +299,29 @@ class RobotController:
         # slewing toward the previously-computed target so stale-error
         # ticks can't push the head past it (this is what was causing
         # the head to swing wildly back and forth).
+
+        # Auto-resume: temporary manual gazes (look_at, look_left, ...)
+        # release themselves after AUTO_RESUME_S so the robot naturally
+        # returns its eyes to whoever it's talking to, like a human.
+        if self._manual_override and now >= self._manual_until:
+            self._manual_override = False
+
+        # Saccade detection: a *big* implied jump on a fresh detection
+        # gets a one-shot speed boost so the head snaps over quickly,
+        # then settles smoothly. This is what makes new-target switches
+        # look responsive.
+        alpha_yaw = ALPHA_YAW
+        alpha_pitch = ALPHA_PITCH
+
         if self._manual_override:
             self._target_yaw = self._manual_yaw
             self._target_pitch = self._manual_pitch
             target_body = self._manual_body_yaw
+            # Snappy slew toward a freshly-set manual target too.
+            if abs(self._manual_yaw - self._sent_yaw) > SACCADE_JUMP_RAD:
+                alpha_yaw = ALPHA_SACCADE
+            if abs(self._manual_pitch - self._sent_pitch) > SACCADE_JUMP_RAD:
+                alpha_pitch = ALPHA_SACCADE
         elif fresh and have_face:
             # Camera is on the head, so err already includes the robot's
             # own motion. ``LEAD_GAIN < 1`` keeps us slightly under-shooting
@@ -279,14 +329,22 @@ class RobotController:
             # the head is still moving.
             ex = err_x if abs(err_x) > DEADZONE else 0.0
             ey = err_y if abs(err_y) > DEADZONE else 0.0
-            self._target_yaw = _clamp(
+            new_target_yaw = _clamp(
                 self._sent_yaw + YAW_SIGN * ex * HALF_HFOV * LEAD_GAIN,
                 -YAW_LIMIT, YAW_LIMIT,
             )
-            self._target_pitch = _clamp(
+            new_target_pitch = _clamp(
                 self._sent_pitch + PITCH_SIGN * ey * HALF_VFOV * LEAD_GAIN,
                 -PITCH_LIMIT, PITCH_LIMIT,
             )
+            # If the new target is far from where we are right now,
+            # treat this as a saccade and slew faster on this tick.
+            if abs(new_target_yaw - self._sent_yaw) > SACCADE_JUMP_RAD:
+                alpha_yaw = ALPHA_SACCADE
+            if abs(new_target_pitch - self._sent_pitch) > SACCADE_JUMP_RAD:
+                alpha_pitch = ALPHA_SACCADE
+            self._target_yaw = new_target_yaw
+            self._target_pitch = new_target_pitch
             target_body = self._compute_body_target(self._target_yaw)
         elif have_face:
             # Stale tick: keep slewing toward the target we already had.
@@ -299,8 +357,8 @@ class RobotController:
             target_body = self._compute_body_target(self._target_yaw)
 
         # ---- 3. Smooth slew -------------------------------------------
-        self._sent_yaw += ALPHA_YAW * (self._target_yaw - self._sent_yaw)
-        self._sent_pitch += ALPHA_PITCH * (self._target_pitch - self._sent_pitch)
+        self._sent_yaw += alpha_yaw * (self._target_yaw - self._sent_yaw)
+        self._sent_pitch += alpha_pitch * (self._target_pitch - self._sent_pitch)
         self._sent_yaw = _clamp(self._sent_yaw, -YAW_LIMIT, YAW_LIMIT)
         self._sent_pitch = _clamp(self._sent_pitch, -PITCH_LIMIT, PITCH_LIMIT)
 

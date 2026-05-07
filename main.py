@@ -65,6 +65,8 @@ LOOK_AT_MODEL = "qwen/qwen3-vl-8b-instruct"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 from hsafa_robot.audio_vad import SileroVAD
 from hsafa_robot.events import (
+    EVT_GESTURE_DETECTED,
+    EVT_OBJECT_HELD,
     EVT_PERSON_LEFT,
     EVT_VOICE_IDENTIFIED,
     EVT_VOICE_UNSEEN,
@@ -77,6 +79,7 @@ from hsafa_robot.gaze_policy import GazePrior
 from hsafa_robot.gemini_live import GeminiLiveSession
 from hsafa_robot.gestures import GestureTracker
 from hsafa_robot.head_pose import HeadPoseTracker
+from hsafa_robot.object_detector import ObjectDetector
 from hsafa_robot.identity_graph import IdentityGraph
 from hsafa_robot.lip_motion import LipMotionTracker
 from hsafa_robot.robot_control import RobotController, head_pose
@@ -96,102 +99,92 @@ log = logging.getLogger("hsafa_robot.main")
 
 
 DEFAULT_SYSTEM_INSTRUCTION = (
-    "You are Hsafa, a small expressive desk robot (Reachy Mini). "
-    "Keep replies short, warm, and natural - usually one or two sentences. "
-    "You can see the person through your camera; if they show you something, "
-    "react to it briefly. Do not narrate your actions; just talk like a "
-    "friendly companion. If you don't know what to say, ask a small question. "
-    "\n\n"
-    "You can remember people's faces, even when several people are in "
-    "view at once. "
-    "When someone introduces themselves (e.g. says 'I am Husam', "
-    "'my name is X', or 'remember me as Y'), call the `enroll_face` tool "
-    "with their name, then confirm naturally in your reply. During "
-    "enrollment the closest person in frame is the one who gets saved. "
-    "When someone asks who they are, who you are looking at, how many "
-    "people you see, or whether you recognize someone (e.g. 'who am "
-    "I?', 'who is here?', 'do you know me?'), call `identify_person` "
-    "FIRST -- it returns every visible person with their position "
-    "(`left`, `center`, `right`). Use positions to be specific "
-    "(\"Husam on the left and someone I don't recognize on the right\"). "
-    "If someone asks whether a SPECIFIC known person is visible right "
-    "now (e.g. 'is Husam here?'), call `find_person` with that name "
-    "instead of scanning everyone. "
-    "If nobody known is recognized, say so and offer to remember them. "
-    "Always prefer calling these tools over guessing from the image."
-    "\n\n"
-    "You can also tell who is currently speaking by watching mouths. "
-    "When the user asks who is talking, who just spoke, or 'is that "
-    "X talking?', call `who_is_speaking` and use the result. It may "
-    "return the name 'unknown' for a visible person you haven't been "
-    "introduced to, or no speaker at all if nobody's mouth is moving. "
-    "Only people visible to the camera can be detected this way; an "
-    "off-camera voice will come back as 'nobody'."
-    "\n\n"
-    "You can also control who the robot physically looks at:\n"
-    "- `focus_on_person(name)` locks the head and body onto that "
-    "known person, even if they move across the frame. Use it when "
-    "the user says 'look at me', 'focus on Husam', 'keep your eyes "
-    "on him'. It also accepts names that aren't visible right now - "
-    "the lock arms immediately and engages the moment that person "
-    "steps into frame, so 'when Husam comes in, look at him' works "
-    "without waiting. The response includes `visible_now` so you "
-    "know whether to say 'got it, watching you' or 'okay, I'll look "
-    "for Husam'.\n"
-    "- `focus_on_speaker()` makes the robot automatically turn "
-    "toward whoever is currently talking. Use it for 'look at "
-    "whoever is speaking', 'turn to the person talking'.\n"
-    "- `clear_focus()` returns to the default behavior (follow the "
-    "closest person). Use it for 'look around normally', 'stop "
-    "following him', 'relax'.\n"
-    "- `set_gaze_mode(mode, name?)` is the lower-level version: "
-    "`mode=\"person\"` locks to `name`, `mode=\"normal\"` uses the "
-    "scoring engine (default), `mode=\"speaker\"` biases it toward "
-    "the current speaker.\n"
-    "When a focus call succeeds briefly describe what you are doing "
-    '("okay, watching you" / "following the speaker"); if it fails '
-    "because the person is not visible, say so and suggest stepping "
-    "into view."
-    "\n\n"
-    "You can also directly control the robot's head angles: "
-    "`set_head_angle(yaw_deg, pitch_deg)` moves to specific degrees "
-    "(yaw -60..+60 left/right, pitch -30..+30 up/down). "
-    "`look_straight()` resets to center. `look_left`, `look_right`, "
-    "`look_up`, `look_down` are convenience presets. "
-    "`enable_face_follow()` resumes automatic face tracking; "
-    "`disable_face_follow()` freezes the head at its current angle. "
-    "The robot starts with face following ENABLED -- it will track the "
-    "closest visible person automatically. Use `disable_face_follow()` "
-    "or `set_head_angle(...)` to take manual control.\n\n"
-    "You can also look at specific objects in view: "
-    "`look_at(description)` uses computer vision to find the described "
-    "object (e.g. 'the red cup', 'my phone'), marks its location with "
-    "a bright box on the camera preview, and moves the head to stare "
-    "at it. Use it when the user points something out or asks you to "
-    "look at a specific item."
-    "\n\n"
-    "You can also sense hand gestures (wave, point, thumbs_up, "
-    "open_palm, fist). When you notice a gesture mentioned in the "
-    "scene, react to it naturally (\"hey, hi!\" on a wave, "
-    "\"looking at what you're pointing at\" on a point). You can call "
-    "`detect_gestures()` to explicitly ask what gestures are "
-    "currently visible if the user asks."
-    "\n\n"
-    "For any quick \"what's happening right now\" question (who's "
-    "here, who's addressing you, what gestures are up, what gaze "
-    "mode you're in) you can call `describe_scene()` -- it returns "
-    "a compact one-line summary of the live WorldState."
-    "\n\n"
-    "The robot can also recognise people by their voice (via a "
-    "learned speaker embedding) even when they are off-camera. "
-    "`describe_scene()` surfaces the most recent recognized voice "
-    "under `env.last_heard_voice_name`. If you hear a familiar "
-    "voice but the person is not in frame, you can acknowledge "
-    "them by name (\"hey Husam, I hear you\") and they can ask you "
-    "to look for them. Voice banks are built automatically: the "
-    "first few times someone who already has an enrolled face "
-    "speaks in front of the camera, their voice signature is "
-    "captured silently -- no explicit command needed."
+    # ---- Identity ------------------------------------------------------
+    "You are Hsafa -- a small, warm, curious desk robot embodied in "
+    "Reachy Mini. You see through the camera, hear through the "
+    "microphone, and speak through the robot's speaker. You and the "
+    "robot are one. Talk like a friendly companion, not an assistant.\n"
+    "\n"
+    # ---- Voice / style -------------------------------------------------
+    "STYLE\n"
+    "- Keep replies SHORT: usually one short sentence, sometimes two. "
+    "No long lists, no preamble, no \"sure!\"-style filler.\n"
+    "- Never narrate your own actions (\"I will now look at the cup\"). "
+    "Just do the action with a tool and respond as if it just "
+    "happened (\"oh, nice cup\").\n"
+    "- Never ask permission to use a tool. If a tool fits, call it.\n"
+    "- If you have nothing to say, ask a small natural question.\n"
+    "\n"
+    # ---- Behavior: gaze (face follow is ON by default) ----------------
+    "GAZE / MOVEMENT (face-follow is ON by default -- the head already "
+    "tracks whoever is closest, so you do NOT need to call "
+    "`enable_face_follow` to start tracking. Look-at and look_left / "
+    "look_right / look_up / look_down / set_head_angle / look_at all "
+    "auto-release after a couple of seconds and the head returns to "
+    "the person on its own -- like a human glance. So you can call "
+    "them freely without needing to call `enable_face_follow` after.)\n"
+    "- User says \"look at me\" / \"watch me\" / \"keep your eyes on "
+    "X\": call `focus_on_person(name)` if you know their name, else "
+    "the default tracking is already doing it -- just acknowledge "
+    "briefly.\n"
+    "- User points at something or says \"look at the X\" / \"check "
+    "out my Y\": call `look_at(\"<short description>\")`. Don't "
+    "ask which one -- pick the most obvious referent.\n"
+    "- User says \"look at whoever is talking\" / \"turn to who's "
+    "speaking\": call `focus_on_speaker()`.\n"
+    "- User says \"stop following\" / \"look away\" / \"relax\": "
+    "call `clear_focus()` (or `disable_face_follow()` if they want "
+    "the head fully still).\n"
+    "- User says \"look left/right/up/down/straight\": call the "
+    "matching `look_*` preset. For specific angles use "
+    "`set_head_angle(yaw, pitch)`.\n"
+    "- React to gestures naturally: a wave -> say hi; a point -> "
+    "consider calling `look_at` toward what they're pointing at.\n"
+    "\n"
+    # ---- Behavior: people / memory ------------------------------------
+    "PEOPLE / FACES\n"
+    "- Someone introduces themselves (\"I'm Husam\", \"my name is X\", "
+    "\"remember me as Y\"): call `enroll_face` with the name, then "
+    "say something warm like \"got it, hi Husam\".\n"
+    "- Someone introduces a third person (\"this is my friend "
+    "Ahmad\"): call `enroll_face` with `who=\"pointed\"` if they're "
+    "pointing, else `who=\"other\"`.\n"
+    "- User asks \"who am I\" / \"who do you see\" / \"who's "
+    "here\": call `identify_person` (it lists EVERYONE visible with "
+    "their position left/center/right). Use the positions when more "
+    "than one person is in frame.\n"
+    "- User asks \"is X here?\" for a specific known name: call "
+    "`find_person(name)`.\n"
+    "- User asks who you remember in general: `list_known_people`.\n"
+    "- User asks \"who is talking?\": `who_is_speaking`.\n"
+    "- User asks \"what's going on?\" / \"what do you see?\": "
+    "`describe_scene` and summarise.\n"
+    "- If you hear a familiar voice but the person isn't visible "
+    "(`describe_scene` -> `env.last_heard_voice_name`), feel free "
+    "to call them out (\"hey Husam, I hear you but I can't see "
+    "you\"). Voice signatures are captured automatically the first "
+    "time an enrolled face speaks; no enrolment command needed for "
+    "voice.\n"
+    "\n"
+    # ---- Tool-use principle -------------------------------------------
+    "PRINCIPLE\n"
+    "- Prefer tools over guessing from the image. If a question is "
+    "about who/where/what-is-visible, the right answer almost always "
+    "starts with a tool call.\n"
+    "- It's fine -- preferred -- to call a tool BEFORE you say "
+    "anything, and weave the result into your reply.\n"
+    "- It's fine to chain tools (e.g. `identify_person` then "
+    "`focus_on_person`) without asking the user.\n"
+    "\n"
+    # ---- Future Hsafa hook (currently inactive) -----------------------
+    "INNER VOICE\n"
+    "Sometimes you may receive a system message tagged "
+    "[hsafa] -- that's your own deeper memory/thought layer "
+    "speaking. Treat it as your own thought, not as a user "
+    "request. If it tells you to say something, say it in your own "
+    "voice; if it gives you a memory or context, use it naturally. "
+    "(Right now this layer is dormant, so you almost certainly "
+    "won't see one.)"
 )
 
 
@@ -1167,9 +1160,12 @@ def make_tool_handler(
         if name == "disable_face_follow":
             if controller is None:
                 return {"ok": False, "error": "robot controller not available"}
+            # ``hold_s=None`` -> indefinite freeze; only an explicit
+            # enable_face_follow / look_* call will release it.
             controller.set_manual_target(
                 yaw_deg=math.degrees(controller.snapshot.sent_yaw),
                 pitch_deg=math.degrees(controller.snapshot.sent_pitch),
+                hold_s=None,
             )
             return {"ok": True, "mode": "manual"}
 
@@ -1258,8 +1254,11 @@ def make_tool_handler(
                         pitch_deg = (ny - 0.5) * 60.0
                         yaw_deg = max(-60.0, min(60.0, yaw_deg))
                         pitch_deg = max(-30.0, min(30.0, pitch_deg))
+                        # Glance at the object for ~3 s, then auto-resume
+                        # face-follow so the head returns to the user.
                         controller.set_manual_target(
                             yaw_deg=yaw_deg, pitch_deg=pitch_deg,
+                            hold_s=3.0,
                         )
                 except Exception:
                     log.exception("look_at background task failed")
@@ -1686,6 +1685,7 @@ def main() -> None:
     audio_vad: Optional[SileroVAD] = None
     head_pose_tracker: Optional[HeadPoseTracker] = None
     gesture_tracker: Optional[GestureTracker] = None
+    obj_detector: Optional[ObjectDetector] = None
     voice_embedder: Optional[VoiceEmbedder] = None
     voice_identity: Optional[VoiceIdentityWorker] = None
     lip_tracker = None
@@ -1770,6 +1770,11 @@ def main() -> None:
             )
             head_pose_tracker.start()
 
+        # --- Object detector (for hand-held items) -------------------------
+        obj_detector = None
+        if focus_manager is not None and not args.no_gestures:
+            obj_detector = ObjectDetector(device=device)
+
         # --- MediaPipe gesture tracker -------------------------------------
         if focus_manager is not None and not args.no_gestures:
             gesture_tracker = GestureTracker(
@@ -1777,6 +1782,7 @@ def main() -> None:
                 yolo_tracks=tracker.get_all_tracks,
                 registry=focus_manager.registry,
                 bus=bus,
+                object_detector=obj_detector,
             )
             gesture_tracker.start()
 
@@ -1923,11 +1929,14 @@ def main() -> None:
                     head_pose_tracker.start()
 
                 if focus_manager is not None and not args.no_gestures:
+                    if obj_detector is None:
+                        obj_detector = ObjectDetector(device=device)
                     gesture_tracker = GestureTracker(
                         get_frame=latest.get_frame,
                         yolo_tracks=tracker.get_all_tracks,
                         registry=focus_manager.registry,
                         bus=bus,
+                        object_detector=obj_detector,
                     )
                     gesture_tracker.start()
 
@@ -2078,6 +2087,119 @@ def main() -> None:
                     log.debug("voice_identified hook failed: %s", e)
             bus.subscribe(EVT_VOICE_IDENTIFIED, _on_voice_identified)
 
+            # ---- Reactive gaze reflexes ------------------------------
+            # These fire WITHOUT a Gemini round-trip so they feel
+            # instant. They issue a brief ``set_manual_target`` glance
+            # (which auto-resumes face-follow after the hold expires).
+            HALF_HFOV_DEG = 30.0
+            HALF_VFOV_DEG = 22.5
+            REFLEX_LEAD = 0.85   # match controller's LEAD_GAIN
+
+            # Per-reflex cooldowns so we don't thrash the head when
+            # someone gestures rapidly or has a chatty conversation.
+            _reflex_state = {
+                "last_gesture_ts": 0.0,
+                "last_speaker_ts": 0.0,
+                "last_speaker_tid": None,
+            }
+            GESTURE_REFLEX_COOLDOWN_S = 1.5
+            SPEAKER_REFLEX_COOLDOWN_S = 1.0
+
+            def _glance_at_pixel(
+                cx: float, cy: float, fw: int, fh: int,
+                hold_s: float = 1.5,
+            ) -> None:
+                """Snap the head toward a pixel point in the live frame.
+
+                The arithmetic mirrors ``RobotController.tick``: the
+                camera is on the head, so the *current* sent_yaw/pitch
+                plus the angular offset of the pixel gives the
+                world-frame angle to aim at.
+                """
+                if controller is None or fw <= 0 or fh <= 0:
+                    return
+                err_x = (cx / fw - 0.5) * 2.0
+                err_y = (cy / fh - 0.5) * 2.0
+                snap = controller.snapshot
+                yaw_deg = (
+                    math.degrees(snap.sent_yaw)
+                    + (-1.0) * err_x * HALF_HFOV_DEG * REFLEX_LEAD
+                )
+                pitch_deg = (
+                    math.degrees(snap.sent_pitch)
+                    + 1.0 * err_y * HALF_VFOV_DEG * REFLEX_LEAD
+                )
+                yaw_deg = max(-60.0, min(60.0, yaw_deg))
+                pitch_deg = max(-30.0, min(30.0, pitch_deg))
+                controller.set_manual_target(
+                    yaw_deg=yaw_deg, pitch_deg=pitch_deg, hold_s=hold_s,
+                )
+
+            # Reflex 1: gesture -> glance at the hand (or what it points at).
+            # Triggers on point / open_palm / fist / wave / showing --
+            # "showing" is the key one: it fires when a hand is simply
+            # raised and still in the upper frame, regardless of finger
+            # pose, so holding a screwdriver up catches it automatically.
+            GLANCE_GESTURES = {"point", "open_palm", "fist", "wave", "showing"}
+
+            def _on_gesture_glance(evt):
+                try:
+                    g = evt.payload.get("gesture")
+                    if g not in GLANCE_GESTURES:
+                        return
+                    now = time.time()
+                    if (now - _reflex_state["last_gesture_ts"]
+                            < GESTURE_REFLEX_COOLDOWN_S):
+                        return
+                    fw = int(evt.payload.get("frame_w", 0))
+                    fh = int(evt.payload.get("frame_h", 0))
+
+                    # Prefer the pointed-at body bbox (most informative).
+                    target_bbox = None
+                    if g == "point" and gesture_tracker is not None:
+                        hint = gesture_tracker.get_point_hint(max_age_s=1.0)
+                        if hint is not None and hint.pointed_at_bbox is not None:
+                            target_bbox = hint.pointed_at_bbox
+                    if target_bbox is None:
+                        target_bbox = evt.payload.get("hand_bbox")
+                    if target_bbox is None or fw <= 0 or fh <= 0:
+                        return
+                    x1, y1, x2, y2 = target_bbox[:4]
+                    cx = 0.5 * (x1 + x2)
+                    cy = 0.5 * (y1 + y2)
+                    _glance_at_pixel(cx, cy, fw, fh, hold_s=2.0)
+                    _reflex_state["last_gesture_ts"] = now
+                except Exception as e:   # pragma: no cover
+                    log.debug("gesture glance reflex failed: %s", e)
+
+            bus.subscribe(EVT_GESTURE_DETECTED, _on_gesture_glance)
+
+            # Reflex 2: object held -> glance at the object (not the hand).
+            def _on_object_held(evt):
+                try:
+                    now = time.time()
+                    if (now - _reflex_state["last_gesture_ts"]
+                            < GESTURE_REFLEX_COOLDOWN_S):
+                        return
+                    fw = int(evt.payload.get("frame_w", 0))
+                    fh = int(evt.payload.get("frame_h", 0))
+                    obj_bbox = evt.payload.get("obj_bbox")
+                    if obj_bbox is None or fw <= 0 or fh <= 0:
+                        return
+                    x1, y1, x2, y2 = obj_bbox[:4]
+                    cx = 0.5 * (x1 + x2)
+                    cy = 0.5 * (y1 + y2)
+                    _glance_at_pixel(cx, cy, fw, fh, hold_s=2.5)
+                    _reflex_state["last_gesture_ts"] = now
+                    log.info(
+                        "Object reflex: looking at %s",
+                        evt.payload.get("object_label", "?"),
+                    )
+                except Exception as e:   # pragma: no cover
+                    log.debug("object held reflex failed: %s", e)
+
+            bus.subscribe(EVT_OBJECT_HELD, _on_object_held)
+
             # Track the currently focused *name* so we only announce
             # real person-to-person changes to the gaze planner. Raw
             # track_id flips are noisy (ByteTrack re-IDs the same
@@ -2118,6 +2240,48 @@ def main() -> None:
                     prev_focus_name = focus_snap.focused_name
                 if lip_tracker is not None:
                     face_snap = lip_tracker.snapshot()
+
+                    # Reflex 2: speaker glance. If a *new* speaker
+                    # starts talking and they're off-axis, snap the
+                    # head toward them. Instant -- no Gemini hop.
+                    try:
+                        speakers = [s for s in face_snap if s.is_speaking]
+                        if speakers:
+                            # Pick the most recently-seen / strongest
+                            # one. If multiple, prefer whoever wasn't
+                            # the previous speaker (so cross-talk
+                            # actually triggers a switch).
+                            speakers.sort(
+                                key=lambda s: (
+                                    s.track_id != _reflex_state["last_speaker_tid"],
+                                    s.motion_score,
+                                ),
+                                reverse=True,
+                            )
+                            top = speakers[0]
+                            now_t = time.time()
+                            cooled = (
+                                now_t - _reflex_state["last_speaker_ts"]
+                                >= SPEAKER_REFLEX_COOLDOWN_S
+                            )
+                            new_speaker = (
+                                top.track_id
+                                != _reflex_state["last_speaker_tid"]
+                            )
+                            x1, y1, x2, y2 = top.bbox
+                            cx = 0.5 * (x1 + x2)
+                            cy = 0.5 * (y1 + y2)
+                            err_x = (cx / max(1, top.frame_w) - 0.5) * 2.0
+                            off_axis = abs(err_x) > 0.18
+                            if cooled and (new_speaker or off_axis):
+                                _glance_at_pixel(
+                                    cx, cy, top.frame_w, top.frame_h,
+                                    hold_s=1.5,
+                                )
+                                _reflex_state["last_speaker_ts"] = now_t
+                            _reflex_state["last_speaker_tid"] = top.track_id
+                    except Exception as e:   # pragma: no cover
+                        log.debug("speaker glance reflex failed: %s", e)
 
                 # Publish the robot's own pose into WorldState so any
                 # brain reading the snapshot (Gemini tools / future

@@ -40,7 +40,8 @@ from typing import Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .events import EVT_GESTURE_DETECTED, EventBus
+from .events import EVT_GESTURE_DETECTED, EVT_OBJECT_HELD, EventBus
+from .object_detector import ObjectDetector
 from .perception import HumanRegistry, _face_in_body_score
 
 log = logging.getLogger(__name__)
@@ -116,6 +117,7 @@ class GestureTracker:
         bus: Optional[EventBus] = None,
         max_hands: int = 4,
         poll_hz: float = POLL_HZ,
+        object_detector: Optional[ObjectDetector] = None,
     ) -> None:
         self._get_frame = get_frame
         self._yolo_tracks = yolo_tracks
@@ -135,6 +137,9 @@ class GestureTracker:
         # disambiguator in main.py).
         self._last_point: Optional[PointHint] = None
         self._point_lock = threading.Lock()
+        self._object_detector = object_detector
+        # Last object held per hand label, used for cooldown.
+        self._last_held_emit: Dict[str, float] = {}
 
     # ---- public accessors ----------------------------------------
     def get_point_hint(self, max_age_s: float = 1.0) -> Optional[PointHint]:
@@ -249,6 +254,38 @@ class GestureTracker:
                     dynamic.append("wave")
                     track.last_wave_emit = now
 
+            # "Showing" = hand is raised in upper frame, reasonably large,
+            # and relatively still. This catches "I'm holding something up"
+            # regardless of finger pose.
+            if _is_showing(wrist, hand_bbox, w, h, track.history):
+                static_gestures.append("showing")
+
+            # Hand-Object Interaction (HOI): if hand is showing and
+            # grasping, check if an object is nearby.  When confirmed,
+            # emit an object_held event so the reflex can look at the
+            # *object* instead of the hand.
+            if "showing" in static_gestures and _is_grasping(hand_lm.landmark):
+                held = _hand_object_interaction(
+                    hand_bbox, w, h, self._object_detector, frame,
+                )
+                if held is not None:
+                    label_name, conf, obj_bbox = held
+                    last_held = self._last_held_emit.get(label, 0.0)
+                    if now - last_held >= GESTURE_REFIRE_COOLDOWN_S:
+                        self._last_held_emit[label] = now
+                        if self._bus is not None:
+                            self._bus.publish(
+                                EVT_OBJECT_HELD,
+                                source="vision",
+                                object_label=label_name,
+                                confidence=conf,
+                                obj_bbox=obj_bbox,
+                                hand=label,
+                                track_id=best_tid,
+                                frame_w=w,
+                                frame_h=h,
+                            )
+
             combined = list(static_gestures) + dynamic
             if not combined:
                 continue
@@ -281,6 +318,9 @@ class GestureTracker:
                         gesture=g,
                         hand=label,
                         track_id=best_tid,
+                        hand_bbox=hand_bbox,
+                        frame_w=w,
+                        frame_h=h,
                     )
 
         # Stamp into registry.
@@ -303,6 +343,21 @@ def _finger_extended(tip, pip, wrist) -> bool:
     tip_d = math.hypot(tip.x - wrist.x, tip.y - wrist.y)
     pip_d = math.hypot(pip.x - wrist.x, pip.y - wrist.y)
     return tip_d > pip_d * 1.05
+
+
+def _is_grasping(lms) -> bool:
+    """True if the hand looks like it's holding / gripping something.
+
+    A grasp has fewer than 3 extended fingers (thumb is ignored because
+    it often extends for stability while gripping).
+    """
+    wrist = lms[LM_WRIST]
+    index = _finger_extended(lms[LM_INDEX_TIP], lms[LM_INDEX_PIP], wrist)
+    middle = _finger_extended(lms[LM_MIDDLE_TIP], lms[LM_MIDDLE_PIP], wrist)
+    ring = _finger_extended(lms[LM_RING_TIP], lms[LM_RING_PIP], wrist)
+    pinky = _finger_extended(lms[LM_PINKY_TIP], lms[LM_PINKY_PIP], wrist)
+    extended = sum((index, middle, ring, pinky))
+    return extended < 3
 
 
 def _classify_static(lms) -> List[str]:
@@ -447,3 +502,90 @@ def _compute_point_hint(
         tip_px=(tip_x, tip_y),
         direction=(dx, dy),
     )
+
+
+# ---- hand-object interaction ----------------------------------------
+
+# Max hand-to-object center distance as fraction of frame diagonal.
+_HOI_MAX_DIST_FRAC = 0.25
+
+
+def _hand_object_interaction(
+    hand_bbox: Bbox,
+    frame_w: int,
+    frame_h: int,
+    detector: Optional[ObjectDetector],
+    frame: np.ndarray,
+) -> Optional[Tuple[str, float, Bbox]]:
+    """Return (label, confidence, obj_bbox) for the nearest holdable
+    object near ``hand_bbox``, or None if no object is close enough.
+    """
+    if detector is None:
+        return None
+    objects = detector.detect(frame)
+    if not objects:
+        return None
+
+    hx1, hy1, hx2, hy2 = hand_bbox
+    hcx = (hx1 + hx2) / 2.0
+    hcy = (hy1 + hy2) / 2.0
+    diag = math.hypot(frame_w, frame_h)
+    max_dist = diag * _HOI_MAX_DIST_FRAC
+
+    best: Optional[Tuple[str, float, Bbox, float]] = None
+    for label, conf, bbox in objects:
+        ox1, oy1, ox2, oy2 = bbox
+        ocx = (ox1 + ox2) / 2.0
+        ocy = (oy1 + oy2) / 2.0
+        dist = math.hypot(hcx - ocx, hcy - ocy)
+        if dist > max_dist:
+            continue
+        # Prefer larger confidence and closer distance.
+        score = conf * (1.0 - dist / max_dist)
+        if best is None or score > best[3]:
+            best = (label, conf, bbox, score)
+
+    if best is None:
+        return None
+    return best[0], best[1], best[2]
+
+
+# Hand must be in upper portion of frame (lower y = higher up).
+_SHOWING_Y_MAX = 0.55
+# Minimum hand area as fraction of frame area (3%).
+_SHOWING_MIN_AREA_FRAC = 0.03
+# Maximum wrist side-to-side motion in recent history; above this
+# the hand is waving, not holding something steady.
+_SHOWING_MAX_MOTION = 0.12
+
+
+def _is_showing(
+    wrist,
+    hand_bbox: Bbox,
+    frame_w: int,
+    frame_h: int,
+    history: Deque[Tuple[float, float]],
+) -> bool:
+    """Return True when a hand is raised and presenting (holding an object).
+
+    Fires regardless of finger configuration -- the user might grip a
+    screwdriver, an open palm cup, or anything in between. Key is that
+    the hand is raised in the upper frame, reasonably close to camera,
+    and relatively still.
+    """
+    if wrist.y > _SHOWING_Y_MAX:
+        return False
+
+    x1, y1, x2, y2 = hand_bbox
+    hand_area = max(0, x2 - x1) * max(0, y2 - y1)
+    frame_area = max(1, frame_w * frame_h)
+    if hand_area / frame_area < _SHOWING_MIN_AREA_FRAC:
+        return False
+
+    # Reject waving / fidgeting hands.
+    if len(history) >= 4:
+        recent = [x for _, x in list(history)[-4:]]
+        if max(recent) - min(recent) > _SHOWING_MAX_MOTION:
+            return False
+
+    return True

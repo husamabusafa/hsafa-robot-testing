@@ -45,6 +45,7 @@ EVT_PERSON_LEFT = "person_left"
 EVT_FACE_ENROLLED = "face_enrolled"
 EVT_NAME_RESOLVED = "name_resolved"        # track_id -> name link appeared
 EVT_GESTURE_DETECTED = "gesture_detected"  # wave / point / thumbs-up / open-palm
+EVT_OBJECT_HELD = "object_held"            # hand + object interaction detected
 
 # Audio / voice
 EVT_AUDIO_SPEECH_ACTIVE = "audio_speech_active"   # bool, from VAD
