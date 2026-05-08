@@ -190,6 +190,12 @@ class GeminiLiveSession:
         # handle on reconnect continues the same conversation so the robot
         # can run indefinitely without losing context.
         self._resumption_handle: Optional[str] = None
+        # Reference to the current live session (set while connected).
+        self._session: Optional[Any] = None
+        # Lock to serialize all writes to the session (mic, video, injection,
+        # tool responses) — the SDK websocket writer is not fully async-safe
+        # for concurrent sends.
+        self._send_lock: Optional[asyncio.Lock] = None
  
     # ---- public API -----------------------------------------------------
     def start(self) -> None:
@@ -221,7 +227,43 @@ class GeminiLiveSession:
  
     def wait_until_ready(self, timeout: float = 10.0) -> bool:
         return self.connected.wait(timeout=timeout)
- 
+
+    def inject_client_content(self, text: str) -> None:
+        """Inject text into the Gemini Live session from any thread.
+
+        Haseef uses this via ``say_this`` to make the robot speak.
+        The text is sent as a client turn with ``turn_complete=True`` so
+        Gemini generates a spoken reply immediately.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            log.warning("inject: no active event loop")
+            return
+
+        async def _send() -> None:
+            session = self._session
+            if session is None:
+                log.warning("inject: no active session")
+                return
+            lock = self._send_lock
+            if lock is None:
+                log.warning("inject: session has no send lock (reconnecting?)")
+                return
+            try:
+                async with lock:
+                    await session.send_client_content(
+                        turns=[types.Content(parts=[types.Part(text=text)])],
+                        turn_complete=True,
+                    )
+                log.info("Injected: %s", text[:80])
+            except Exception as e:
+                log.warning("inject failed: %s", e)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        except Exception as e:
+            log.warning("inject scheduling failed: %s", e)
+
     # ---- thread entry ---------------------------------------------------
     def _thread_main(self) -> None:
         try:
@@ -324,13 +366,19 @@ class GeminiLiveSession:
             self._model, "yes" if self._resumption_handle else "no",
         )
         async with client.aio.live.connect(model=self._model, config=config) as session:
+            self._session = session
+            self._send_lock = asyncio.Lock()
             self.connected.set()
             log.info("Gemini Live: connected")
-            await asyncio.gather(
-                self._mic_task(session),
-                self._video_task(session),
-                self._receive_task(session),
-            )
+            try:
+                await asyncio.gather(
+                    self._mic_task(session),
+                    self._video_task(session),
+                    self._receive_task(session),
+                )
+            finally:
+                self._session = None
+                self._send_lock = None
  
     # ---- mic -> Gemini --------------------------------------------------
     async def _mic_task(self, session) -> None:
@@ -456,13 +504,15 @@ class GeminiLiveSession:
                     stats["blocks"] += 1
  
                 try:
-                    await session.send_realtime_input(
-                        audio=types.Blob(
-                            data=pcm16.tobytes(),
-                            mime_type=f"audio/pcm;rate={GEMINI_INPUT_SR}",
-                        ),
-                    )
-                    stats["sent"] += 1
+                    if self._send_lock is not None:
+                        async with self._send_lock:
+                            await session.send_realtime_input(
+                                audio=types.Blob(
+                                    data=pcm16.tobytes(),
+                                    mime_type=f"audio/pcm;rate={GEMINI_INPUT_SR}",
+                                ),
+                            )
+                        stats["sent"] += 1
                 except Exception as e:
                     stats["send_fail"] += 1
                     log.warning("mic send_realtime_input failed: %s", e)
@@ -484,14 +534,15 @@ class GeminiLiveSession:
             except Exception as e:
                 log.warning("frame_source raised: %s", e)
                 jpeg = None
-            if jpeg:
+            if jpeg and self._send_lock is not None:
                 try:
-                    await session.send_realtime_input(
-                        video=types.Blob(
-                            data=jpeg,
-                            mime_type="image/jpeg",
-                        ),
-                    )
+                    async with self._send_lock:
+                        await session.send_realtime_input(
+                            video=types.Blob(
+                                data=jpeg,
+                                mime_type="image/jpeg",
+                            ),
+                        )
                 except Exception as e:
                     log.warning("video send failed: %s", e)
             await asyncio.sleep(self._video_period)
@@ -719,6 +770,7 @@ class GeminiLiveSession:
             )
 
         try:
-            await session.send_tool_response(function_responses=responses)
+            async with self._send_lock:
+                await session.send_tool_response(function_responses=responses)
         except Exception as e:
             log.warning("send_tool_response failed: %s", e)
