@@ -60,23 +60,19 @@ PITCH_LIMIT = math.radians(30)
 
 # How fast we slew the head toward the target each frame. ``ALPHA`` is
 # the per-tick fraction of the remaining error we close. Lower = smoother
-# / less overshoot, higher = snappier. 0.12 gives a ~95% settling time of
-# roughly 0.7 s at 30 FPS.
-ALPHA_YAW = 0.12
-ALPHA_PITCH = 0.12
+# / less overshoot, higher = snappier.
+ALPHA_YAW = 0.07
+ALPHA_PITCH = 0.07
 
 # Fraction of the angular offset we *aim for* on each fresh detection.
-# Less than 1.0 because the camera is mounted on the head: by the time
-# the head finishes turning, the target will already be close to the
-# centre of the image, so chasing 100% of the measured offset overshoots.
-LEAD_GAIN = 0.85
+# Kept well below 1.0 because the camera rides on the head: chasing 100%
+# of the measured offset causes the head to overshoot and oscillate.
+LEAD_GAIN = 0.70
 
-# When a fresh detection implies a *large* angular jump (target moved
-# far -- new person, look-at switch, sudden movement), boost the slew
-# rate for that one tick so the head snaps over quickly, then settles
-# back to the smooth ALPHA. Mimics human saccade-then-fixate.
-SACCADE_JUMP_RAD = math.radians(8)
-ALPHA_SACCADE = 0.4
+# When a fresh detection implies a *large* angular jump, boost the slew
+# rate for that one tick so the head snaps over, then settles.
+SACCADE_JUMP_RAD = math.radians(10)
+ALPHA_SACCADE = 0.25
 
 # How long a *temporary* manual gaze (look_at / look_left / look_right /
 # look_up / look_down / set_head_angle) holds before automatically
@@ -84,9 +80,18 @@ ALPHA_SACCADE = 0.4
 # that locks the head indefinitely.
 AUTO_RESUME_S = 2.5
 
-# Tiny dead-zone on the normalized image error to avoid micro-jitter
-# when the target is already centered.
-DEADZONE = 0.04
+# Dead-zone on the normalized image error. Larger zone prevents the
+# head from hunting back and forth when the face is already centered.
+DEADZONE = 0.08
+
+# Exponential-moving-average factor for raw tracker error. Rejects
+# keypoint jitter from YOLOv8-Pose so the target doesn't dart around.
+ERR_SMOOTH = 0.5
+
+# Hard per-frame rate limit on commanded head motion. Stops integrator
+# wind-up from crossing over a moving or suddenly-stopped face.
+MAX_YAW_DELTA = math.radians(5.0)
+MAX_PITCH_DELTA = math.radians(4.0)
 
 # How long after the last detection we still trust the cached error
 # before we declare the face lost.
@@ -187,6 +192,10 @@ class RobotController:
         self._last_det_ts = 0.0
         self._last_seen = 0.0
         self._last_tick = time.time()
+
+        # Smoothed tracker errors (EMA) to reject keypoint jitter.
+        self._smooth_err_x = 0.0
+        self._smooth_err_y = 0.0
 
         # Manual override -- face follow is ON by default. ``_manual_until``
         # is a unix timestamp; if non-zero, we automatically return to
@@ -323,12 +332,19 @@ class RobotController:
             if abs(self._manual_pitch - self._sent_pitch) > SACCADE_JUMP_RAD:
                 alpha_pitch = ALPHA_SACCADE
         elif fresh and have_face:
+            # Smooth raw tracker error to reject keypoint / detection jitter.
+            self._smooth_err_x += ERR_SMOOTH * (err_x - self._smooth_err_x)
+            self._smooth_err_y += ERR_SMOOTH * (err_y - self._smooth_err_y)
+
+            sx = self._smooth_err_x
+            sy = self._smooth_err_y
+            ex = sx if abs(sx) > DEADZONE else 0.0
+            ey = sy if abs(sy) > DEADZONE else 0.0
+
             # Camera is on the head, so err already includes the robot's
             # own motion. ``LEAD_GAIN < 1`` keeps us slightly under-shooting
             # the measured offset so we don't blow past the target while
             # the head is still moving.
-            ex = err_x if abs(err_x) > DEADZONE else 0.0
-            ey = err_y if abs(err_y) > DEADZONE else 0.0
             new_target_yaw = _clamp(
                 self._sent_yaw + YAW_SIGN * ex * HALF_HFOV * LEAD_GAIN,
                 -YAW_LIMIT, YAW_LIMIT,
@@ -357,8 +373,19 @@ class RobotController:
             target_body = self._compute_body_target(self._target_yaw)
 
         # ---- 3. Smooth slew -------------------------------------------
+        # Low-pass step toward the target, then rate-limit the delta so
+        # integrator wind-up can't blow past a moving or stopped face.
+        prev_yaw = self._sent_yaw
+        prev_pitch = self._sent_pitch
+
         self._sent_yaw += alpha_yaw * (self._target_yaw - self._sent_yaw)
         self._sent_pitch += alpha_pitch * (self._target_pitch - self._sent_pitch)
+
+        dy = self._sent_yaw - prev_yaw
+        dp = self._sent_pitch - prev_pitch
+        self._sent_yaw = prev_yaw + _clamp(dy, -MAX_YAW_DELTA, MAX_YAW_DELTA)
+        self._sent_pitch = prev_pitch + _clamp(dp, -MAX_PITCH_DELTA, MAX_PITCH_DELTA)
+
         self._sent_yaw = _clamp(self._sent_yaw, -YAW_LIMIT, YAW_LIMIT)
         self._sent_pitch = _clamp(self._sent_pitch, -PITCH_LIMIT, PITCH_LIMIT)
 

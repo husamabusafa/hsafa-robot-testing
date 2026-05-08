@@ -1683,7 +1683,7 @@ def main() -> None:
     face_recognizer: Optional[FaceRecognizer] = None
     face_tools: Optional[list] = None
     face_db: Optional[FaceDB] = None
-    if not args.no_face_recognition:
+    if not args.no_face_recognition and FaceDB is not None and FaceRecognizer is not None:
         face_db = FaceDB(FACE_DB_DIR)
         # Stay on CPU: the models are small and face tools run on demand
         # (not every frame), so a GPU is not worth the MPS portability
