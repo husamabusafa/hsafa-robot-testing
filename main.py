@@ -183,6 +183,19 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "`set_head_angle(yaw, pitch)`.\n"
     "- React to gestures naturally: a wave -> say hi; a point -> "
     "consider calling `look_at` toward what they're pointing at.\n"
+    "- EXPLORATION / SEARCHING: You are an AUTONOMOUS AGENT. When "
+    "the user asks you to find, search for, or locate something, "
+    "you MUST do it silently without asking permission. Look in one "
+    "direction (`look_left`, `look_right`, `look_up`, `look_down`, or "
+    "`look_straight`), observe the camera feed, then immediately call "
+    "the NEXT movement tool if you do not see the target. Chain these "
+    "tool calls yourself -- NEVER ask the user 'should I look right?' "
+    "or 'shall I continue?'. Do NOT speak while searching. Stay "
+    "completely silent between steps. Only speak AFTER you have either "
+    "found the target (then say something like 'there it is!') or "
+    "exhausted all reasonable directions (then say 'I looked around "
+    "but I don't see it'). Make ONE movement per tool call; the head "
+    "needs time to physically turn before the next command.\n"
     "\n"
     # ---- Behavior: people / memory ------------------------------------
     "PEOPLE / FACES\n"
@@ -216,8 +229,11 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "starts with a tool call.\n"
     "- It's fine -- preferred -- to call a tool BEFORE you say "
     "anything, and weave the result into your reply.\n"
-    "- It's fine to chain tools (e.g. `identify_person` then "
-    "`focus_on_person`) without asking the user.\n"
+    "- It's fine to chain non-movement tools (e.g. `identify_person` "
+    "then `focus_on_person`) without asking the user. For head "
+    "movements, do ONE at a time and observe the camera before "
+    "deciding the next move. When exploring, chain movement tools "
+    "autonomously -- do NOT ask the user for confirmation between steps.\n"
     "\n"
     # ---- Future Hsafa hook (currently inactive) -----------------------
     "INNER VOICE\n"
@@ -310,8 +326,13 @@ def build_test_tools() -> list:
                     name="look_straight",
                     description=(
                         "Reset the robot's head to center (yaw=0, pitch=0). "
-                        "Use when the user says 'look straight', 'center', "
-                        "'reset your head', or 'look forward'."
+                        "The head will move and pause there so you can observe "
+                        "the camera feed. If you are searching for something "
+                        "and do not see it, try another direction. If you DO "
+                        "see the target object, call `look_at(description)` "
+                        "to align precisely with it. Use when the user says "
+                        "'look straight', 'center', 'reset your head', or "
+                        "'look forward'."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
@@ -322,7 +343,12 @@ def build_test_tools() -> list:
                     name="look_left",
                     description=(
                         "Turn the robot's head 30 degrees to the left. "
-                        "Use when the user says 'look left'."
+                        "The head will move and pause there so you can observe "
+                        "the camera feed. If you are searching for something "
+                        "and do not see it, try another direction. If you DO "
+                        "see the target object, call `look_at(description)` "
+                        "to align precisely with it. Use when the user says "
+                        "'look left' or when exploring left side of the room."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
@@ -333,7 +359,12 @@ def build_test_tools() -> list:
                     name="look_right",
                     description=(
                         "Turn the robot's head 30 degrees to the right. "
-                        "Use when the user says 'look right'."
+                        "The head will move and pause there so you can observe "
+                        "the camera feed. If you are searching for something "
+                        "and do not see it, try another direction. If you DO "
+                        "see the target object, call `look_at(description)` "
+                        "to align precisely with it. Use when the user says "
+                        "'look right' or when exploring right side of the room."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
@@ -344,7 +375,12 @@ def build_test_tools() -> list:
                     name="look_up",
                     description=(
                         "Tilt the robot's head 15 degrees up. "
-                        "Use when the user says 'look up'."
+                        "The head will move and pause there so you can observe "
+                        "the camera feed. If you are searching for something "
+                        "and do not see it, try another direction. If you DO "
+                        "see the target object, call `look_at(description)` "
+                        "to align precisely with it. Use when the user says "
+                        "'look up' or when exploring upper area."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
@@ -355,7 +391,12 @@ def build_test_tools() -> list:
                     name="look_down",
                     description=(
                         "Tilt the robot's head 15 degrees down. "
-                        "Use when the user says 'look down'."
+                        "The head will move and pause there so you can observe "
+                        "the camera feed. If you are searching for something "
+                        "and do not see it, try another direction. If you DO "
+                        "see the target object, call `look_at(description)` "
+                        "to align precisely with it. Use when the user says "
+                        "'look down' or when exploring lower area."
                     ),
                     parameters=genai_types.Schema(
                         type=genai_types.Type.OBJECT,
@@ -1154,6 +1195,8 @@ def make_tool_handler(
         def _clamp_angle(v: float, lo: float, hi: float) -> float:
             return max(lo, min(hi, v))
 
+        _SETTLE_S = 1.2   # seconds to let head physically arrive
+
         if name == "set_head_angle":
             if controller is None:
                 return {"ok": False, "error": "robot controller not available"}
@@ -1162,37 +1205,91 @@ def make_tool_handler(
             yaw = _clamp_angle(yaw, -60, 60)
             pitch = _clamp_angle(pitch, -30, 30)
             controller.set_manual_target(yaw_deg=yaw, pitch_deg=pitch)
-            return {"ok": True, "yaw_deg": yaw, "pitch_deg": pitch, "mode": "manual"}
+            await asyncio.sleep(_SETTLE_S)
+            return {
+                "ok": True, "yaw_deg": yaw, "pitch_deg": pitch, "mode": "manual",
+                "next_action_hint": (
+                    "Head is now at this angle. If searching, continue autonomously "
+                    "-- call the next look_* or set_head_angle tool yourself without "
+                    "asking permission. Only speak when you find the target or run out "
+                    "of directions."
+                ),
+            }
 
         if name == "look_straight":
             if controller is None:
                 return {"ok": False, "error": "robot controller not available"}
             controller.set_manual_target(yaw_deg=0, pitch_deg=0)
-            return {"ok": True, "yaw_deg": 0, "pitch_deg": 0, "mode": "manual"}
+            await asyncio.sleep(_SETTLE_S)
+            return {
+                "ok": True, "yaw_deg": 0, "pitch_deg": 0, "mode": "manual",
+                "next_action_hint": (
+                    "Head is now centered. If searching, continue autonomously "
+                    "-- call the next movement tool (look_* or set_head_angle) "
+                    "yourself without asking permission. Only speak when you find "
+                    "the target or run out of directions."
+                ),
+            }
 
         if name == "look_left":
             if controller is None:
                 return {"ok": False, "error": "robot controller not available"}
             controller.set_manual_target(yaw_deg=30, pitch_deg=0)
-            return {"ok": True, "yaw_deg": 30, "pitch_deg": 0, "mode": "manual"}
+            await asyncio.sleep(_SETTLE_S)
+            return {
+                "ok": True, "yaw_deg": 30, "pitch_deg": 0, "mode": "manual",
+                "next_action_hint": (
+                    "Head is now facing left. If searching, continue autonomously "
+                    "-- call the next movement tool (look_* or set_head_angle) "
+                    "yourself without asking permission. Only speak when you find "
+                    "the target or run out of directions."
+                ),
+            }
 
         if name == "look_right":
             if controller is None:
                 return {"ok": False, "error": "robot controller not available"}
             controller.set_manual_target(yaw_deg=-30, pitch_deg=0)
-            return {"ok": True, "yaw_deg": -30, "pitch_deg": 0, "mode": "manual"}
+            await asyncio.sleep(_SETTLE_S)
+            return {
+                "ok": True, "yaw_deg": -30, "pitch_deg": 0, "mode": "manual",
+                "next_action_hint": (
+                    "Head is now facing right. If searching, continue autonomously "
+                    "-- call the next movement tool (look_* or set_head_angle) "
+                    "yourself without asking permission. Only speak when you find "
+                    "the target or run out of directions."
+                ),
+            }
 
         if name == "look_up":
             if controller is None:
                 return {"ok": False, "error": "robot controller not available"}
             controller.set_manual_target(yaw_deg=0, pitch_deg=-15)
-            return {"ok": True, "yaw_deg": 0, "pitch_deg": -15, "mode": "manual"}
+            await asyncio.sleep(_SETTLE_S)
+            return {
+                "ok": True, "yaw_deg": 0, "pitch_deg": -15, "mode": "manual",
+                "next_action_hint": (
+                    "Head is now tilted up. If searching, continue autonomously "
+                    "-- call the next movement tool (look_* or set_head_angle) "
+                    "yourself without asking permission. Only speak when you find "
+                    "the target or run out of directions."
+                ),
+            }
 
         if name == "look_down":
             if controller is None:
                 return {"ok": False, "error": "robot controller not available"}
             controller.set_manual_target(yaw_deg=0, pitch_deg=15)
-            return {"ok": True, "yaw_deg": 0, "pitch_deg": 15, "mode": "manual"}
+            await asyncio.sleep(_SETTLE_S)
+            return {
+                "ok": True, "yaw_deg": 0, "pitch_deg": 15, "mode": "manual",
+                "next_action_hint": (
+                    "Head is now tilted down. If searching, continue autonomously "
+                    "-- call the next movement tool (look_* or set_head_angle) "
+                    "yourself without asking permission. Only speak when you find "
+                    "the target or run out of directions."
+                ),
+            }
 
         if name == "enable_face_follow":
             if controller is None:
