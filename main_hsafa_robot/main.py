@@ -43,6 +43,7 @@ if str(_repo_root) not in sys.path:
 from hsafa_robot.gemini_live import GeminiLiveSession
 from hsafa_voice_vision import Camera, RobotController
 from hsafa_sdk import HsafaSDK, SdkOptions
+from main_hsafa_robot.scheduler_skill import SchedulerSkill
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -101,7 +102,12 @@ def build_gemini_system_prompt() -> str:
         "  impatient, indifferent, inquiring, irritated, laughing, lonely, lost, love, neutral,\n"
         "  no, oops, proud, rage, relief, reprimand, resigned, sad, scared, serenity, shy,\n"
         "  sleep, success, surprised, thoughtful, tired, uncertain, uncomfortable, understanding,\n"
-        "  welcoming, yes.\n\n"
+        "  welcoming, yes.\n"
+        "- create_schedule(description, type, scheduled_at?, cron_expression?, timezone?):\n"
+        "  Haseef can schedule tasks to run later (one-time or recurring cron).\n"
+        "  When the schedule fires, Haseef receives a schedule.triggered event.\n"
+        "- list_schedules(): List all active schedules.\n"
+        "- cancel_schedule(schedule_id): Cancel an active schedule.\n\n"
 
         "=== WHEN TO USE queue_thinker_task ===\n"
         "- User asks for PHYSICAL action (move head, look around, etc.)\n"
@@ -219,6 +225,7 @@ class UnifiedBridge:
         camera: Any,
         haseef_id: str,
         main_loop: Optional[asyncio.AbstractEventLoop] = None,
+        scheduler: Optional[SchedulerSkill] = None,
     ) -> None:
         self.gemini = gemini
         self.haseef_sdk = haseef_sdk
@@ -228,11 +235,39 @@ class UnifiedBridge:
         self._main_loop = main_loop
         self._say_lock = asyncio.Lock()
         self._pending_says: list[str] = []
+        self.scheduler = scheduler
 
     # --- Haseef setup -------------------------------------------------------
     async def setup_haseef(self) -> None:
         """Register all Haseef tools and attach handlers."""
         await self.haseef_sdk.register_tools([
+            {
+                "name": "create_schedule",
+                "description": (
+                    "Create a schedule so Haseef handles a task later. "
+                    "Use 'one_time' with a scheduled_at epoch timestamp, or "
+                    "'recurring' with a cron_expression."
+                ),
+                "input": {
+                    "description": "string",
+                    "type": "string",
+                    "scheduled_at": "number?",
+                    "cron_expression": "string?",
+                    "timezone": "string?",
+                },
+            },
+            {
+                "name": "list_schedules",
+                "description": "List all active schedules.",
+                "input": {},
+            },
+            {
+                "name": "cancel_schedule",
+                "description": "Cancel an active schedule by its id.",
+                "input": {
+                    "schedule_id": "string",
+                },
+            },
             {
                 "name": "look_around",
                 "description": (
@@ -300,9 +335,12 @@ class UnifiedBridge:
                 },
             },
         ])
-        log.info("[Haseef] Registered 5 tools: look_around, set_head_pose, say_this, capture_image, show_expression.")
+        log.info("[Haseef] Registered 8 tools: create_schedule, list_schedules, cancel_schedule, look_around, set_head_pose, say_this, capture_image, show_expression.")
 
         # Tool handlers
+        self.haseef_sdk.on_tool_call("create_schedule", self._handle_create_schedule)
+        self.haseef_sdk.on_tool_call("list_schedules", self._handle_list_schedules)
+        self.haseef_sdk.on_tool_call("cancel_schedule", self._handle_cancel_schedule)
         self.haseef_sdk.on_tool_call("look_around", self._handle_look_around)
         self.haseef_sdk.on_tool_call("set_head_pose", self._handle_set_head_pose)
         self.haseef_sdk.on_tool_call("say_this", self._handle_say_this)
@@ -340,6 +378,86 @@ class UnifiedBridge:
             log.info("[ImageEvent] Pushed image to Haseef (%d KB)", len(jpeg_b64) // 1024)
         except Exception as e:
             log.error("[ImageEvent] Failed to push image: %s", e)
+
+    async def _push_schedule_event(self, schedule) -> None:
+        """Push a schedule.triggered event to Haseef so it can react."""
+        try:
+            await self._run_sdk_on_main(self.haseef_sdk.push_event({
+                "type": "schedule.triggered",
+                "data": {
+                    "scheduleId": schedule.id,
+                    "description": schedule.description,
+                    "type": schedule.type,
+                    "cronExpression": schedule.cron_expression,
+                    "timezone": schedule.timezone,
+                    "lastRunAt": schedule.last_run_at,
+                    "formattedContext": self._build_schedule_context(schedule),
+                },
+                "haseefId": self.haseef_id,
+            }))
+            log.info("[ScheduleEvent] Pushed '%s' to Haseef", schedule.description)
+        except Exception as e:
+            log.error("[ScheduleEvent] Failed to push: %s", e)
+
+    def _build_schedule_context(self, schedule) -> str:
+        lines = [
+            "[SCHEDULED TASK TRIGGERED]",
+            f"Description: {schedule.description}",
+            f"Type: {schedule.type}",
+        ]
+        if schedule.cron_expression:
+            lines.append(f"Cron: {schedule.cron_expression}")
+        if schedule.timezone:
+            lines.append(f"Timezone: {schedule.timezone}")
+        lines.append("\nThis scheduled task has fired. Please carry out the described action.")
+        return "\n".join(lines)
+
+    # --- Scheduler handlers (Haseef tools) ---------------------------------
+    async def _handle_create_schedule(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        description = args.get("description", "")
+        type_ = args.get("type", "one_time")
+        scheduled_at = args.get("scheduled_at")
+        cron = args.get("cron_expression")
+        timezone = args.get("timezone", "UTC")
+
+        if self.scheduler is None:
+            return {"ok": False, "error": "Scheduler not available"}
+
+        try:
+            sid = self.scheduler.add_schedule(
+                description=description,
+                type=type_,
+                scheduled_at=scheduled_at,
+                cron_expression=cron,
+                timezone=timezone,
+            )
+            return {
+                "ok": True,
+                "schedule_id": sid,
+                "type": type_,
+                "next_run_at": scheduled_at,
+            }
+        except Exception as exc:
+            log.error("[Haseef tool] create_schedule failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    async def _handle_list_schedules(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if self.scheduler is None:
+            return {"ok": False, "error": "Scheduler not available"}
+        return {"ok": True, "schedules": self.scheduler.list_schedules()}
+
+    async def _handle_cancel_schedule(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        sid = args.get("schedule_id", "")
+        if self.scheduler is None:
+            return {"ok": False, "error": "Scheduler not available"}
+        ok = self.scheduler.cancel_schedule(sid)
+        return {"ok": ok, "schedule_id": sid}
 
     async def _handle_show_expression(self, args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         name = args.get("emotion", "neutral")
@@ -633,10 +751,24 @@ async def main() -> None:
         )
         sys.exit(1)
 
+    # --- Scheduler ------------------------------------------------------------
+    main_loop = asyncio.get_running_loop()
+
+    def on_schedule_trigger(schedule):
+        if main_loop and not main_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(
+                bridge._push_schedule_event(schedule), main_loop
+            )
+
+    scheduler = SchedulerSkill(on_trigger=on_schedule_trigger)
+    scheduler.start(poll_interval=30.0)
+    log.info("Scheduler ready.")
+
     # --- Bridge -------------------------------------------------------------
     bridge = UnifiedBridge(
         None, haseef_sdk, robot, camera, haseef_id,
-        main_loop=asyncio.get_running_loop(),
+        main_loop=main_loop,
+        scheduler=scheduler,
     )
     await bridge.setup_haseef()
 
@@ -810,6 +942,9 @@ async def main() -> None:
 
         if robot:
             robot.stop_idle()
+
+        if scheduler:
+            scheduler.stop()
     camera.close()
     log.info("Shutdown complete.")
 

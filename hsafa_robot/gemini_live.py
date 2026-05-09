@@ -232,8 +232,10 @@ class GeminiLiveSession:
         """Inject text into the Gemini Live session from any thread.
 
         Haseef uses this via ``say_this`` to make the robot speak.
-        The text is sent as a client turn with ``turn_complete=True`` so
-        Gemini generates a spoken reply immediately.
+        We use ``send_realtime_input(text=...)`` instead of
+        ``send_client_content`` because the SDK explicitly warns that
+        interleaving the two in the same conversation is not recommended
+        and can cause the server to close the connection.
         """
         loop = self._loop
         if loop is None or loop.is_closed():
@@ -251,10 +253,7 @@ class GeminiLiveSession:
                 return
             try:
                 async with lock:
-                    await session.send_client_content(
-                        turns=[types.Content(parts=[types.Part(text=text)])],
-                        turn_complete=True,
-                    )
+                    await session.send_realtime_input(text=text)
                 log.info("Injected: %s", text[:80])
             except Exception as e:
                 log.warning("inject failed: %s", e)

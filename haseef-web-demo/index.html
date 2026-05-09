@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Haseef Event Sender</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      margin: 0;
+    }
+    .card {
+      background: #1e293b;
+      padding: 2rem;
+      border-radius: 1rem;
+      width: 100%;
+      max-width: 480px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+    }
+    h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
+    p.sub { margin: 0 0 1.5rem; color: #94a3b8; font-size: 0.9rem; }
+    label { display: block; margin-bottom: 0.35rem; font-size: 0.85rem; color: #cbd5e1; }
+    input, textarea {
+      width: 100%;
+      padding: 0.65rem 0.8rem;
+      border: 1px solid #334155;
+      border-radius: 0.5rem;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-size: 0.95rem;
+      margin-bottom: 1rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus, textarea:focus { border-color: #38bdf8; }
+    textarea { min-height: 80px; resize: vertical; }
+    button {
+      width: 100%;
+      padding: 0.75rem;
+      border: none;
+      border-radius: 0.5rem;
+      background: #38bdf8;
+      color: #0f172a;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+    button:hover { opacity: 0.9; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .status {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-radius: 0.5rem;
+      font-size: 0.9rem;
+      display: none;
+    }
+    .status.ok { background: #064e3b; color: #6ee7b7; display: block; }
+    .status.err { background: #450a0a; color: #fca5a5; display: block; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Send Event to Haseef</h1>
+    <p class="sub">Push a <code>user_message</code> event to your Haseef agent.</p>
+
+    <label for="apiKey">HSAFA Core Key</label>
+    <input id="apiKey" type="password" placeholder="sk_prod_..." />
+
+    <label for="haseefId">Haseef ID</label>
+    <input id="haseefId" value="c8d4d183-c1a6-4bdf-a998-abc301c0c12d" />
+
+    <label for="skill">Skill</label>
+    <input id="skill" value="robot_base" />
+
+    <label for="message">Message</label>
+    <textarea id="message" placeholder="Type your message..."></textarea>
+
+    <button id="sendBtn">Send Event</button>
+    <div id="status" class="status"></div>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
