@@ -21,9 +21,11 @@ import io
 import json
 import math
 import os
+import random
 import signal
 import sys
 import tempfile
+import threading
 import time
 import wave
 from dataclasses import dataclass
@@ -53,9 +55,16 @@ HASEEF_NAME = os.environ.get("HASEEF_NAME", "RobotVision")
 HASEEF_ID = os.environ.get("HASEEF_ID", "8aa60ad7-cb23-4e44-a26c-e8b7c8332d11")
 
 # Robot
+from hsafa_robot.emotion_player import EmotionClipPlayer
+
 ROBOT_AVAILABLE = False
 try:
     from reachy_mini import ReachyMini
+    from hsafa_robot.animation import (
+        IdleAnimation,
+        TalkingAnimation,
+        blend_offsets,
+    )
     from hsafa_robot.robot_control import head_pose
     ROBOT_AVAILABLE = True
 except ImportError:
@@ -302,25 +311,45 @@ class RobotHead:
             print(f"[robot] Failed to connect: {e}")
             return False
 
-    def move(self, yaw_deg: float, pitch_deg: float) -> bool:
+    def move(
+        self, yaw_deg: float, pitch_deg: float, body_yaw_deg: float = 0.0
+    ) -> bool:
         if self.reachy is None:
-            print(f"[robot] SIMULATE move(yaw={yaw_deg}, pitch={pitch_deg})")
+            print(
+                f"[robot] SIMULATE move(yaw={yaw_deg}, pitch={pitch_deg}, "
+                f"body_yaw={body_yaw_deg})"
+            )
             return True
         try:
             import math
             self.reachy.set_target(
-                head=head_pose(roll=0.0, pitch=math.radians(pitch_deg), yaw=math.radians(yaw_deg)),
+                head=head_pose(
+                    roll=0.0, pitch=math.radians(pitch_deg), yaw=math.radians(yaw_deg)
+                ),
+                body_yaw=math.radians(body_yaw_deg),
             )
-            print(f"[robot] Head moved to yaw={yaw_deg}, pitch={pitch_deg}")
+            print(
+                f"[robot] Head moved to yaw={yaw_deg}, pitch={pitch_deg}, "
+                f"body_yaw={body_yaw_deg}"
+            )
             return True
         except Exception as e:
             print(f"[robot] set_target failed: {e}")
             return False
 
-    def move_smooth(self, yaw_deg: float, pitch_deg: float, duration: float = 0.3) -> bool:
-        """Smooth interpolated head move — fast but not jerky."""
+    def move_smooth(
+        self,
+        yaw_deg: float,
+        pitch_deg: float,
+        duration: float = 0.3,
+        body_yaw_deg: float = 0.0,
+    ) -> bool:
+        """Smooth interpolated head + body move."""
         if self.reachy is None:
-            print(f"[robot] SIMULATE move_smooth(yaw={yaw_deg}, pitch={pitch_deg})")
+            print(
+                f"[robot] SIMULATE move_smooth(yaw={yaw_deg}, pitch={pitch_deg}, "
+                f"body_yaw={body_yaw_deg})"
+            )
             return True
         try:
             import math
@@ -328,13 +357,19 @@ class RobotHead:
                 from reachy_mini.utils.interpolation import InterpolationTechnique
                 method = InterpolationTechnique.MIN_JERK
             except Exception:
-                method = "minimum_jerk"  # fallback string literal
+                method = "minimum_jerk"
             self.reachy.goto_target(
-                head=head_pose(roll=0.0, pitch=math.radians(pitch_deg), yaw=math.radians(yaw_deg)),
+                head=head_pose(
+                    roll=0.0, pitch=math.radians(pitch_deg), yaw=math.radians(yaw_deg)
+                ),
                 duration=duration,
                 method=method,
+                body_yaw=math.radians(body_yaw_deg),
             )
-            print(f"[robot] Head moved smoothly to yaw={yaw_deg}, pitch={pitch_deg} (dur={duration}s)")
+            print(
+                f"[robot] Head moved smoothly to yaw={yaw_deg}, pitch={pitch_deg}, "
+                f"body_yaw={body_yaw_deg} (dur={duration}s)"
+            )
             return True
         except Exception as e:
             print(f"[robot] goto_target failed: {e}")
@@ -350,6 +385,193 @@ class RobotHead:
             except Exception:
                 pass
             self.reachy = None
+
+
+# ---------------------------------------------------------------------------
+# Animation Controller
+# ---------------------------------------------------------------------------
+class AnimationController:
+    """Manages idle, talking, tool-call, and expression animations.
+
+    Priority (highest first): expression > tool_call > talking > idle
+    """
+
+    EXPRESSIONS: Dict[str, Dict[str, float]] = {
+        "neutral":  {"yaw": 0, "pitch": 0},
+        "happy":    {"yaw": 0, "pitch": -25},
+        "sad":      {"yaw": 0, "pitch": 25},
+        "angry":    {"yaw": 0, "pitch": 10},
+        "surprised": {"yaw": 0, "pitch": -30},
+        "love":     {"yaw": 10, "pitch": -15},
+        "tired":    {"yaw": 0, "pitch": 30},
+        "confused": {"yaw": 20, "pitch": 0},
+        "excited":  {"yaw": 0, "pitch": -35},
+    }
+
+    def __init__(self, head: RobotHead) -> None:
+        self.head = head
+        self._state = "idle"
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="anim-ctrl")
+
+        # Timers
+        self._next_idle_move = 0.0
+        self._next_talk_bob = 0.0
+        self._expr_end = 0.0
+        self._expr_return_end = 0.0
+        self._expr_name = "neutral"
+        self._tool_end = 0.0
+
+        # Audio-based talking detection
+        self._last_audio_time = 0.0
+
+        # Deduplication
+        self._last_yaw = 0.0
+        self._last_pitch = 0.0
+
+        # Emotion clip player (HF dataset)
+        self._emotion_player = EmotionClipPlayer(head)
+
+    # ---- public API --------------------------------------------------------
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def notify_audio(self, samples: Optional[bytes]) -> None:
+        """Call from speaker_sink whenever audio samples are pushed."""
+        if samples and len(samples) > 0:
+            self._last_audio_time = time.time()
+
+    def set_tool_call(self, duration: float = 0.8) -> None:
+        """Brief 'thinking' animation while a tool is handled."""
+        with self._lock:
+            self._state = "tool_call"
+            self._tool_end = time.time() + duration
+
+    def show_expression(self, name: str, duration: float = 2.0) -> None:
+        """Play a facial expression.
+
+        Tries the HuggingFace emotion clip first; falls back to a static pose
+        if no clip is available or the player is not ready.
+        """
+        # Stop any running clip first
+        self._emotion_player.stop()
+
+        with self._lock:
+            self._state = "expression"
+            self._expr_name = name
+            now = time.time()
+            self._expr_end = now + duration
+            # After expression, spend 1.5s returning to neutral before idle
+            self._expr_return_end = self._expr_end + 1.5
+
+        # Try animated clip first
+        if self._emotion_player.play(name, duration=duration):
+            return
+
+        # Fallback: static pose
+        expr = self.EXPRESSIONS.get(name, self.EXPRESSIONS["neutral"])
+        self._send_smooth(expr["yaw"], expr["pitch"], 0.5)
+
+    def list_expressions(self) -> List[str]:
+        return list(self.EXPRESSIONS.keys())
+
+    # ---- internal loop ------------------------------------------------------
+    def _run_loop(self) -> None:
+        while not self._stop.is_set():
+            now = time.time()
+            state: str
+
+            with self._lock:
+                state = self._state
+
+                # Auto-expire transient states
+                if state == "tool_call" and now > self._tool_end:
+                    self._state = "idle"
+                    state = "idle"
+                elif state == "expression":
+                    if now > self._expr_return_end:
+                        self._state = "idle"
+                        state = "idle"
+                        self._next_idle_move = now + 2.0  # give idle a break
+                    elif now > self._expr_end:
+                        state = "returning"
+
+                # Audio-driven talking promotion (lowest priority)
+                is_talking = (now - self._last_audio_time) < 0.3
+                if state not in ("expression", "tool_call"):
+                    if is_talking and state != "talking":
+                        self._state = "talking"
+                        state = "talking"
+                        self._next_talk_bob = 0.0
+                    elif not is_talking and state == "talking":
+                        self._state = "idle"
+                        state = "idle"
+                        self._next_idle_move = 0.0
+
+            if state == "idle":
+                self._do_idle(now)
+            elif state == "talking":
+                self._do_talking(now)
+            elif state == "tool_call":
+                self._do_tool_call(now)
+            elif state == "expression":
+                self._do_expression(now)
+            elif state == "returning":
+                self._do_returning(now)
+
+            time.sleep(0.1)
+
+    # ---- animation primitives -----------------------------------------------
+    def _send_smooth(
+        self, yaw: float, pitch: float, duration: float, body_yaw: float = 0.0
+    ) -> None:
+        """Only send if pose changed significantly to avoid spamming."""
+        if (
+            abs(yaw - self._last_yaw) > 1.0
+            or abs(pitch - self._last_pitch) > 1.0
+        ):
+            self.head.move_smooth(yaw, pitch, duration, body_yaw_deg=body_yaw)
+            self._last_yaw = yaw
+            self._last_pitch = pitch
+
+    def _do_idle(self, now: float) -> None:
+        if now > self._next_idle_move:
+            yaw = random.uniform(-8, 8)
+            pitch = random.uniform(-5, 5)
+            self._send_smooth(yaw, pitch, 2.0)
+            self._next_idle_move = now + random.uniform(4, 7)
+
+    def _do_talking(self, now: float) -> None:
+        if now > self._next_talk_bob:
+            base = -2.0 if self._last_pitch > 0 else 2.0
+            pitch = base + random.uniform(-1.5, 1.5)
+            self._send_smooth(0, pitch, 0.4)
+            self._next_talk_bob = now + 0.7
+
+    def _do_tool_call(self, now: float) -> None:
+        # Brief attentive look-up
+        self._send_smooth(0, -5, 0.3)
+        time.sleep(0.5)
+        with self._lock:
+            if self._state == "tool_call":
+                self._state = "idle"
+                self._next_idle_move = time.time() + 1.0
+
+    def _do_expression(self, now: float) -> None:
+        # If a clip is playing, it handles the motion in its own thread.
+        # Otherwise re-send the static pose so idle doesn't override it.
+        if not self._emotion_player._current_name:
+            expr = self.EXPRESSIONS.get(self._expr_name, self.EXPRESSIONS["neutral"])
+            self._send_smooth(expr["yaw"], expr["pitch"], 0.5)
+
+    def _do_returning(self, now: float) -> None:
+        """Smoothly return to neutral after an expression."""
+        self._send_smooth(0, 0, 1.0)
 
 
 # ---------------------------------------------------------------------------

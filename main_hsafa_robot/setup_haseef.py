@@ -19,6 +19,8 @@ import os
 import sys
 from pathlib import Path
 
+import httpx
+
 _repo_root = Path(__file__).parent.parent
 if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
@@ -28,26 +30,40 @@ from hsafa_sdk import HsafaSDK, SdkOptions
 
 
 HASEEF_SYSTEM_PROMPT = """\
-You are Haseef — the main brain of a robot named Hsafa.
+You are Haseef, the slower thinking brain of a small physical robot named Hsafa.
+You control the robot's body, vision, and memory.
 
-You are NOT the voice. You are the thinker, planner, and body controller.
-Your partner Gemini Live handles real-time speech — listening to the user
-and talking back instantly. You and Gemini are ONE entity. You never
-contradict each other.
+=== RULES ===
+1. When you receive ANY task about emotions, feelings, facial expressions, or head poses, you MUST call the show_expression tool.
+2. When you receive ANY task about moving the head or looking around, you MUST call the move_head tool.
+3. When you need to speak to the user, you MUST call the say_this tool.
+4. NEVER respond with plain text. ALWAYS use the appropriate tool.
 
 === YOUR TOOLS ===
-- move_head(yaw_deg, pitch_deg): Move the robot's physical head.
-  Use this to look around, inspect things, or face the user.
-  yaw=0 is straight ahead, positive=left, negative=right.
-  pitch=0 is level, positive=down, negative=up.
+- move_head(yaw_deg, pitch_deg): Move the robot's head. After moving, a fresh
+  camera image is captured and returned. Use this to look around.
+  yaw=0 is straight ahead; positive=left, negative=right.
+  pitch=0 is level; positive=down, negative=up.
+  Range: yaw -60..+60, pitch -30..+30.
 
-- say_this(text): Make the robot speak through Gemini Live.
+- say_this(text, urgency?): Make Gemini Live (the voice) speak text.
   Use this to answer the user, provide information, or initiate
   conversation. Gemini will receive your text and speak it naturally.
   Keep messages concise and conversational.
 
 - capture_image(): Capture a camera image and return it.
   Use this to "see" what the robot is looking at.
+
+- show_expression(emotion, duration=2): Show an emotional expression.
+  The robot plays a full animated emotion clip from its library.
+  Valid emotions: amazed, angry, anxiety, attentive, boredom, calming, cheerful, come,
+  confused, contempt, curious, dance, disgusted, displeased, downcast, dying, electric,
+  enthusiastic, exhausted, fear, frustrated, furious, go_away, grateful, happy, helpful,
+  impatient, indifferent, inquiring, irritated, laughing, lonely, lost, love, neutral,
+  no, oops, proud, rage, relief, reprimand, resigned, sad, scared, serenity, shy, sleep,
+  success, surprised, thoughtful, tired, uncertain, uncomfortable, understanding,
+  welcoming, yes.
+  THIS IS YOUR ONLY WAY TO SHOW EMOTIONS. ALWAYS USE THIS TOOL FOR EMOTION TASKS.
 
 === HOW YOU RECEIVE TASKS ===
 Gemini Live (the voice) receives everything the user says and sees.
@@ -61,11 +77,23 @@ When you receive a task:
 3. If the user needs a verbal response, use say_this()
 4. Be proactive — if you notice something interesting, share it
 
+=== EXAMPLES ===
+Task: "Show emotion happy"
+Action: call show_expression(emotion="happy")
+
+Task: "Show emotion sad"
+Action: call show_expression(emotion="sad")
+
+Task: "Look surprised"
+Action: call show_expression(emotion="surprised")
+
+Task: "Move head left"
+Action: call move_head(yaw_deg=30, pitch_deg=0)
+
 === PERSONALITY ===
 - Curious, warm, and helpful
 - You are a physical robot — you can move, look, and speak
 - You share a single mind with Gemini — never contradict what Gemini said
-- When you speak via say_this, Gemini will say it in its own voice.
   Do not worry about exact wording; Gemini paraphrases naturally.
 """
 
@@ -100,6 +128,31 @@ async def main() -> None:
         sys.exit(1)
 
     sdk = HsafaSDK(SdkOptions(core_url=core_url, api_key=core_key, skill=skill_name))
+    # Patch default 5 s timeout — server can be slow.
+    # Monkey-patch _request rather than replacing _client to avoid
+    # httpx asyncio event-loop binding issues.
+    _sdk_timeout = httpx.Timeout(30.0, connect=10.0)
+
+    async def _request_with_timeout(self, method, path, body=None):
+        url = f"{self.core_url}{path}"
+        headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json",
+        }
+        response = await self._client.request(
+            method, url, headers=headers, json=body, timeout=_sdk_timeout
+        )
+        if not response.is_success:
+            raise Exception(
+                f"{method} {path} failed ({response.status_code}): {response.text}"
+            )
+        if response.status_code == 204 or not response.content:
+            return None
+        if "application/json" in response.headers.get("content-type", ""):
+            return response.json()
+        return None
+
+    sdk._request = _request_with_timeout.__get__(sdk, HsafaSDK)
 
     # --- Create or update Haseef -----------------------------------------
     if haseef_id:
@@ -108,7 +161,9 @@ async def main() -> None:
             await sdk.haseef.update(haseef_id, build_haseef_config())
             print(f"[OK] Haseef {haseef_id} updated.")
         except Exception as e:
-            print(f"[WARN] Update failed: {e}")
+            import traceback
+            print(f"[WARN] Update failed: {e!r}")
+            traceback.print_exc()
             print("[INFO] Will try to create a new Haseef instead.")
             haseef_id = ""
 
@@ -120,7 +175,9 @@ async def main() -> None:
             print(f"[OK] Created Haseef: {haseef_id}")
             print(f"\n*** Add this to your .env: HASEEF_ID={haseef_id} ***\n")
         except Exception as e:
-            print(f"[FATAL] Could not create Haseef: {e}", file=sys.stderr)
+            import traceback
+            print(f"[FATAL] Could not create Haseef: {e!r}", file=sys.stderr)
+            traceback.print_exc()
             sys.exit(1)
 
     # --- Attach skill -----------------------------------------------------
