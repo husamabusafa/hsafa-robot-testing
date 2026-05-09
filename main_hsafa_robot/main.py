@@ -85,7 +85,12 @@ def build_gemini_system_prompt() -> str:
 
         "=== HASEEF'S TOOLS (you KNOW about these but CANNOT call them directly) ===\n"
         "Only use queue_thinker_task for these specific actions:\n"
-        "- move_head(yaw_deg, pitch_deg): Move the robot's physical head.\n"
+        "- look_around(yaw_deg, pitch_deg): Move the robot's head and get a fresh\n"
+        "  camera image. Haseef uses this to SEE.\n"
+        "  yaw=0 is straight ahead, positive=left, negative=right.\n"
+        "  pitch=0 is level, positive=down, negative=up.\n"
+        "- set_head_pose(yaw_deg, pitch_deg): Move the robot's physical head\n"
+        "  WITHOUT getting an image. Use for simple positioning.\n"
         "  yaw=0 is straight ahead, positive=left, negative=right.\n"
         "  pitch=0 is level, positive=down, negative=up.\n"
         "- say_this(text): Haseef can make you speak something.\n"
@@ -227,13 +232,30 @@ class UnifiedBridge:
         """Register all Haseef tools and attach handlers."""
         await self.haseef_sdk.register_tools([
             {
-                "name": "move_head",
+                "name": "look_around",
                 "description": (
                     "Move the robot's head to a specific yaw and pitch angle "
-                    "in degrees. After moving, a fresh camera image is captured "
-                    "and returned. Use this to look around, search for people, "
-                    "or inspect objects. yaw=0 is straight ahead; positive=left, "
-                    "negative=right. pitch=0 is level; positive=down, negative=up. "
+                    "in degrees, then capture and return a fresh camera image. "
+                    "Use this when you need to SEE something: look around, search "
+                    "for people, inspect objects, or verify what's in front of you. "
+                    "yaw=0 is straight ahead; positive=left, negative=right. "
+                    "pitch=0 is level; positive=down, negative=up. "
+                    "Range: yaw -60..+60, pitch -30..+30."
+                ),
+                "input": {
+                    "yaw_deg": "number",
+                    "pitch_deg": "number",
+                },
+            },
+            {
+                "name": "set_head_pose",
+                "description": (
+                    "Move the robot's head to a specific yaw and pitch angle "
+                    "in degrees. No image is returned. Use this for simple "
+                    "physical positioning: face forward, look left/right, nod, "
+                    "or adjust posture when you do NOT need to see the result. "
+                    "yaw=0 is straight ahead; positive=left, negative=right. "
+                    "pitch=0 is level; positive=down, negative=up. "
                     "Range: yaw -60..+60, pitch -30..+30."
                 ),
                 "input": {
@@ -276,10 +298,11 @@ class UnifiedBridge:
                 },
             },
         ])
-        log.info("[Haseef] Registered 4 tools: move_head, say_this, capture_image, show_expression.")
+        log.info("[Haseef] Registered 5 tools: look_around, set_head_pose, say_this, capture_image, show_expression.")
 
         # Tool handlers
-        self.haseef_sdk.on_tool_call("move_head", self._handle_move_head)
+        self.haseef_sdk.on_tool_call("look_around", self._handle_look_around)
+        self.haseef_sdk.on_tool_call("set_head_pose", self._handle_set_head_pose)
         self.haseef_sdk.on_tool_call("say_this", self._handle_say_this)
         self.haseef_sdk.on_tool_call("capture_image", self._handle_capture_image)
         self.haseef_sdk.on_tool_call("show_expression", self._handle_show_expression)
@@ -295,6 +318,27 @@ class UnifiedBridge:
         self.haseef_sdk.on("thought", lambda e: log.info("[Haseef] thought: %s", e))
 
     # --- Haseef tool handlers -----------------------------------------------
+    async def _push_image_event(self, jpeg_b64: str, note: str = "") -> None:
+        """Push an event with the image as an attachment so Haseef's LLM can see it."""
+        if not jpeg_b64:
+            return
+        try:
+            await self._run_sdk_on_main(self.haseef_sdk.push_event({
+                "type": "user_message",
+                "data": {"text": note or "Robot vision update."},
+                "attachments": [
+                    {
+                        "type": "image",
+                        "mimeType": "image/jpeg",
+                        "base64": jpeg_b64,
+                    }
+                ],
+                "haseefId": self.haseef_id,
+            }))
+            log.info("[ImageEvent] Pushed image to Haseef (%d KB)", len(jpeg_b64) // 1024)
+        except Exception as e:
+            log.error("[ImageEvent] Failed to push image: %s", e)
+
     async def _handle_show_expression(self, args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         name = args.get("emotion", "neutral")
         valid = self.robot.list_expressions()
@@ -305,27 +349,49 @@ class UnifiedBridge:
         log.info("[Haseef tool] show_expression: %s", name)
         return {"ok": True, "emotion": name}
 
-    async def _handle_move_head(
+    async def _handle_look_around(
         self, args: Dict[str, Any], ctx: Dict[str, Any]
     ) -> Dict[str, Any]:
         yaw = float(args.get("yaw_deg", 0))
         pitch = float(args.get("pitch_deg", 0))
-        log.info("[Haseef tool] move_head(yaw=%.1f, pitch=%.1f)", yaw, pitch)
+        log.info("[Haseef tool] look_around(yaw=%.1f, pitch=%.1f)", yaw, pitch)
 
         yaw = max(-60, min(60, yaw))
         pitch = max(-30, min(30, pitch))
 
-        # goto_target is blocking; run in thread
         await asyncio.to_thread(self.robot.move_head, yaw, pitch, 0.3)
         await asyncio.sleep(0.5)
 
         jpeg_b64 = self.camera.get_base64_jpeg() if self.camera else None
+        if jpeg_b64:
+            await self._push_image_event(
+                jpeg_b64,
+                note=f"Head moved to yaw={yaw}, pitch={pitch}. Here is what I see.",
+            )
         return {
             "ok": True,
             "yaw_deg": yaw,
             "pitch_deg": pitch,
             "image_base64": jpeg_b64,
             "note": f"Head moved to yaw={yaw}, pitch={pitch}.",
+        }
+
+    async def _handle_set_head_pose(
+        self, args: Dict[str, Any], ctx: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        yaw = float(args.get("yaw_deg", 0))
+        pitch = float(args.get("pitch_deg", 0))
+        log.info("[Haseef tool] set_head_pose(yaw=%.1f, pitch=%.1f)", yaw, pitch)
+
+        yaw = max(-60, min(60, yaw))
+        pitch = max(-30, min(30, pitch))
+
+        await asyncio.to_thread(self.robot.move_head, yaw, pitch, 0.3)
+        return {
+            "ok": True,
+            "yaw_deg": yaw,
+            "pitch_deg": pitch,
+            "note": f"Head pose set to yaw={yaw}, pitch={pitch}.",
         }
 
     async def _handle_say_this(
@@ -356,6 +422,10 @@ class UnifiedBridge:
         jpeg_b64 = self.camera.get_base64_jpeg()
         if jpeg_b64:
             log.info("[Haseef tool] capture_image: %d KB", len(jpeg_b64) // 1024)
+            await self._push_image_event(
+                jpeg_b64,
+                note="Here is what I see right now.",
+            )
         else:
             log.warning("[Haseef tool] capture_image failed")
         return {"ok": jpeg_b64 is not None, "image_base64": jpeg_b64}
@@ -592,6 +662,7 @@ async def main() -> None:
 
         # Create robot controller now that we have the ReachyMini instance
         robot = RobotController(reachy)
+        robot.start_idle()
         bridge.robot = robot
         log.info("Robot controller ready.")
 
@@ -655,6 +726,8 @@ async def main() -> None:
             return media.get_audio_sample()
 
         def speaker_sink(samples):
+            if robot:
+                robot.notify_audio(samples)
             media.push_audio_sample(samples)
 
         # --- Gemini Live ----------------------------------------------------
@@ -707,6 +780,9 @@ async def main() -> None:
 
         _cap_running.clear()
         capture_thread.join(timeout=1.0)
+
+        if robot:
+            robot.stop_idle()
     camera.close()
     log.info("Shutdown complete.")
 

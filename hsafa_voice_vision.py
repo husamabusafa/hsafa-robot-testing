@@ -9,6 +9,8 @@ from __future__ import annotations
 import base64
 import logging
 import math
+import threading
+import time
 from typing import List, Optional
 
 import cv2
@@ -94,44 +96,166 @@ class Camera:
 class RobotController:
     """Minimal wrapper around ReachyMini.
 
-    - Head movement via goto_target (smooth) or set_target (instant).
-    - Emotions via the official RecordedMoves library + play_move().
+    Priority (highest first): expression > speaking > idle
     """
 
     def __init__(self, reachy) -> None:
         self.reachy = reachy
         self._emotions = None  # lazy-loaded RecordedMoves
+        self._anim_state = "idle"  # "idle", "speaking", "expression"
+        self._last_audio_time = 0.0
+        self._speech_amp = 0.0
+        self._stop_idle = threading.Event()
+        self._idle_thread: Optional[threading.Thread] = None
 
+    # ---- speaking detection ------------------------------------------------
+    def notify_audio(self, samples) -> None:
+        """Call from speaker_sink whenever Gemini audio is pushed.
+
+        samples is a numpy ndarray (float32 @ 16 kHz) from gemini_live.
+        """
+        try:
+            if samples is not None and len(samples) > 0:
+                self._last_audio_time = time.time()
+                raw = float(np.abs(samples).mean())
+                scaled = min(raw * 20.0, 1.0)
+                self._speech_amp = 0.7 * self._speech_amp + 0.3 * scaled
+                if self._anim_state not in ("expression",):
+                    self._anim_state = "speaking"
+        except Exception as e:
+            log.error("notify_audio failed: %s", e)
+
+    # ---- idle / animation loop ---------------------------------------------
+    def start_idle(self) -> None:
+        """Start the background animation thread."""
+        self._stop_idle.clear()
+        self._idle_thread = threading.Thread(target=self._idle_loop, daemon=True, name="idle")
+        self._idle_thread.start()
+        log.info("Animation loop started.")
+
+    def stop_idle(self) -> None:
+        """Stop the background animation thread."""
+        self._stop_idle.set()
+        if self._idle_thread:
+            self._idle_thread.join(timeout=1.0)
+        log.info("Animation loop stopped.")
+
+    def _idle_loop(self) -> None:
+        """Continuous loop: idle sway, audio-reactive speaking, or sleep during expression."""
+        import random
+        import time
+
+        from reachy_mini.utils import create_head_pose
+
+        t0 = time.time()
+        next_drift = 0.0
+        pitch_off = 0.0
+        yaw_off = 0.0
+
+        # Speaking emphasis state
+        next_emphasis = 0.0
+        emphasis_yaw = 0.0
+        emphasis_decay = 0.0
+
+        while not self._stop_idle.is_set():
+            state = self._anim_state
+
+            # Expression has full control — just sleep
+            if state == "expression":
+                time.sleep(0.05)
+                continue
+
+            # Speaking timeout → idle after 1.5 s silence (accounts for audio buffer)
+            if state == "speaking" and time.time() - self._last_audio_time > 1.5:
+                self._anim_state = "idle"
+                state = "idle"
+                self._speech_amp = 0.0
+                emphasis_decay = 0.0
+
+            t = time.time() - t0
+
+            if state == "speaking":
+                amp = self._speech_amp
+
+                # 1. Audio-reactive bob (z + pitch at 5.5 Hz)
+                phase = 2 * math.pi * t * 5.5
+                bob_z = amp * 6.0 * math.sin(phase)
+                bob_pitch = amp * 6.0 * math.sin(phase)
+
+                # 2. Slow ambient drift
+                drift_yaw = 3.0 * math.sin(2 * math.pi * t / 6.1)
+                drift_roll = 1.5 * math.sin(2 * math.pi * t / 8.7)
+
+                # 3. Occasional emphasis tilts
+                if t > next_emphasis and amp > 0.1:
+                    emphasis_yaw = random.uniform(-10.0, 10.0)
+                    emphasis_decay = 1.0
+                    next_emphasis = t + random.uniform(2.0, 5.0)
+                if emphasis_decay > 0.01:
+                    emphasis_decay *= 0.95  # fade ~1 s
+
+                pose = create_head_pose(
+                    z=bob_z,
+                    pitch=bob_pitch,
+                    yaw=drift_yaw + emphasis_yaw * emphasis_decay,
+                    roll=drift_roll,
+                    degrees=True,
+                    mm=True,
+                )
+            else:
+                # Idle: subtle roll sway + micro-glances
+                roll = 1.5 * math.sin(2 * math.pi * t / 7.3)
+                if t > next_drift:
+                    pitch_off = random.uniform(-3.0, 3.0)
+                    yaw_off = random.uniform(-5.0, 5.0)
+                    next_drift = t + random.uniform(3.0, 8.0)
+
+                pose = create_head_pose(
+                    roll=roll,
+                    pitch=pitch_off,
+                    yaw=yaw_off,
+                    degrees=True,
+                    mm=True,
+                )
+            self.reachy.set_target_head_pose(pose)
+
+            # Antennas always sway (same for idle & speaking)
+            ant_r = 0.3 * math.sin(2 * math.pi * t / 5.7)
+            ant_l = 0.3 * math.sin(2 * math.pi * t / 6.3 + 1.0)
+            self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
+
+            time.sleep(0.02)  # ~50 Hz
+
+    # ---- emotions ----------------------------------------------------------
     def _load_emotions(self):
         if self._emotions is None:
             from reachy_mini.motion.recorded_move import RecordedMoves
             self._emotions = RecordedMoves("pollen-robotics/reachy-mini-emotions-library")
         return self._emotions
 
-    def move_head(self, yaw_deg: float, pitch_deg: float, duration: float = 0.3) -> None:
-        """Smoothly move the head to a yaw/pitch angle (degrees)."""
-        self.reachy.goto_target(
-            head=head_pose(
-                roll=0.0,
-                pitch=math.radians(pitch_deg),
-                yaw=math.radians(yaw_deg),
-            ),
-            duration=duration,
-        )
-        log.info("Head moved to yaw=%.1f pitch=%.1f (dur=%.2fs)", yaw_deg, pitch_deg, duration)
-
-    def center_head(self, duration: float = 0.5) -> None:
-        self.move_head(0, 0, duration=duration)
-
     def show_expression(self, name: str) -> bool:
-        """Play a recorded emotion clip (motion + sound)."""
+        """Play a recorded emotion clip (motion + sound).
+
+        Pauses the animation loop, plays the clip, then smoothly returns to neutral.
+        """
         try:
+            from reachy_mini.utils import create_head_pose
+
+            self._anim_state = "expression"
             moves = self._load_emotions()
             move = moves.get(name)
             self.reachy.play_move(move, initial_goto_duration=0.5, sound=True)
             log.info("Played emotion '%s' (%.2fs)", name, move.duration)
+
+            # Smoothly return to neutral before resuming idle/speaking
+            self.reachy.goto_target(
+                head=create_head_pose(roll=0, pitch=0, yaw=0, degrees=True, mm=True),
+                duration=1.5,
+            )
+            self._anim_state = "idle"
             return True
         except Exception as e:
+            self._anim_state = "idle"
             log.warning("Expression '%s' failed: %s", name, e)
             return False
 
@@ -143,3 +267,21 @@ class RobotController:
 
     def cancel_expression(self) -> None:
         self.reachy.cancel_move()
+
+    # ---- head movement -----------------------------------------------------
+    def move_head(self, yaw_deg: float, pitch_deg: float, duration: float = 0.3) -> None:
+        """Smoothly move the head to a yaw/pitch angle (degrees)."""
+        self._anim_state = "expression"
+        self.reachy.goto_target(
+            head=head_pose(
+                roll=0.0,
+                pitch=math.radians(pitch_deg),
+                yaw=math.radians(yaw_deg),
+            ),
+            duration=duration,
+        )
+        self._anim_state = "idle"
+        log.info("Head moved to yaw=%.1f pitch=%.1f (dur=%.2fs)", yaw_deg, pitch_deg, duration)
+
+    def center_head(self, duration: float = 0.5) -> None:
+        self.move_head(0, 0, duration=duration)
