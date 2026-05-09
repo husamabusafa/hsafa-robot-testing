@@ -26,23 +26,41 @@ LOG_FILE="logs/daemon.log"
 OUT_FILE="logs/daemon.stdout.log"
 BIN=".venv/bin/reachy-mini-daemon"
 
+# Auto-detect Reachy Mini USB serial port (CDC/ACM, not generic usbserial)
+REACHY_SERIAL_PORT=""
+for p in /dev/cu.usbmodem*; do
+  if [[ -e "$p" ]]; then
+    REACHY_SERIAL_PORT="$p"
+    break
+  fi
+done
+if [[ -z "$REACHY_SERIAL_PORT" ]]; then
+  echo "WARNING: No /dev/cu.usbmodem* port found. Daemon will try auto-detect."
+fi
+
 start_daemon() {
   if [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "daemon already running (pid $(cat "$PID_FILE"))"
     return 0
   fi
   [[ -x "$BIN" ]] || { echo "Run 'pip install -r requirements.txt' first"; exit 1; }
-  "$BIN" --headless --localhost-only \
-         --log-level INFO --log-file "$LOG_FILE" \
-         > "$OUT_FILE" 2>&1 &
+  if [[ -n "$REACHY_SERIAL_PORT" ]]; then
+    "$BIN" --headless --localhost-only -p "$REACHY_SERIAL_PORT" \
+           --log-level INFO --log-file "$LOG_FILE" \
+           > "$OUT_FILE" 2>&1 &
+  else
+    "$BIN" --headless --localhost-only \
+           --log-level INFO --log-file "$LOG_FILE" \
+           > "$OUT_FILE" 2>&1 &
+  fi
   echo $! > "$PID_FILE"
   PID=$!
   echo "daemon started (pid $PID)"
   echo "waiting for motor + media init (port 8000) ..."
 
-  # GStreamer webrtcsink codec discovery can take 15+ s on macOS, so
-  # actively poll instead of sleeping a fixed amount.
-  for i in $(seq 1 60); do
+  # GStreamer webrtcsink codec discovery + motor init can take 90+ s on macOS,
+  # so actively poll instead of sleeping a fixed amount.
+  for i in $(seq 1 120); do
     if ! kill -0 "$PID" 2>/dev/null; then
       echo "ERROR: daemon process died during startup. Last log lines:"
       tail -n 30 "$OUT_FILE"
@@ -56,7 +74,7 @@ start_daemon() {
     sleep 1
   done
 
-  echo "ERROR: daemon did not bind to port 8000 within 60s. Last log lines:"
+  echo "ERROR: daemon did not bind to port 8000 within 120s. Last log lines:"
   tail -n 30 "$OUT_FILE"
   exit 1
 }
@@ -85,15 +103,21 @@ start_daemon_wireless() {
     return 0
   fi
   [[ -x "$BIN" ]] || { echo "Run 'pip install -r requirements.txt' first"; exit 1; }
-  "$BIN" --headless --localhost-only --wireless-version \
-         --log-level INFO --log-file "$LOG_FILE" \
-         > "$OUT_FILE" 2>&1 &
+  if [[ -n "$REACHY_SERIAL_PORT" ]]; then
+    "$BIN" --headless --localhost-only --wireless-version -p "$REACHY_SERIAL_PORT" \
+           --log-level INFO --log-file "$LOG_FILE" \
+           > "$OUT_FILE" 2>&1 &
+  else
+    "$BIN" --headless --localhost-only --wireless-version \
+           --log-level INFO --log-file "$LOG_FILE" \
+           > "$OUT_FILE" 2>&1 &
+  fi
   echo $! > "$PID_FILE"
   PID=$!
   echo "daemon started with wireless mode (pid $PID)"
   echo "waiting for motor + media init (port 8000) ..."
 
-  for i in $(seq 1 60); do
+  for i in $(seq 1 120); do
     if ! kill -0 "$PID" 2>/dev/null; then
       echo "ERROR: daemon process died during startup. Last log lines:"
       tail -n 30 "$OUT_FILE"
@@ -107,7 +131,7 @@ start_daemon_wireless() {
     sleep 1
   done
 
-  echo "ERROR: daemon did not bind to port 8000 within 60s. Last log lines:"
+  echo "ERROR: daemon did not bind to port 8000 within 120s. Last log lines:"
   tail -n 30 "$OUT_FILE"
   exit 1
 }
