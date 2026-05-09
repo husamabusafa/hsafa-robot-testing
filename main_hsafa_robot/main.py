@@ -41,12 +41,7 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from hsafa_robot.gemini_live import GeminiLiveSession
-from hsafa_voice_vision import (
-    AnimationController,
-    AudioRecorder,
-    Camera,
-    RobotHead,
-)
+from hsafa_voice_vision import Camera, RobotController
 from hsafa_sdk import HsafaSDK, SdkOptions
 
 # ---------------------------------------------------------------------------
@@ -94,7 +89,7 @@ def build_gemini_system_prompt() -> str:
         "  yaw=0 is straight ahead, positive=left, negative=right.\n"
         "  pitch=0 is level, positive=down, negative=up.\n"
         "- say_this(text): Haseef can make you speak something.\n"
-        "- show_expression(emotion, duration=2): Show an animated emotion.\n"
+        "- show_expression(emotion): Show an animated emotion clip (motion + sound).\n"
         "  Valid: amazed, angry, anxiety, attentive, boredom, calming, cheerful, come,\n"
         "  confused, contempt, curious, dance, disgusted, displeased, downcast, dying, electric,\n"
         "  enthusiastic, exhausted, fear, frustrated, furious, go_away, grateful, happy, helpful,\n"
@@ -215,17 +210,15 @@ class UnifiedBridge:
         self,
         gemini: Optional[Any],
         haseef_sdk: Any,
-        head: RobotHead,
+        robot: RobotController,
         camera: Any,
-        animation: AnimationController,
         haseef_id: str,
         main_loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
         self.gemini = gemini
         self.haseef_sdk = haseef_sdk
-        self.head = head
+        self.robot = robot
         self.camera = camera
-        self.animation = animation
         self.haseef_id = haseef_id
         self._main_loop = main_loop
 
@@ -269,13 +262,17 @@ class UnifiedBridge:
             {
                 "name": "show_expression",
                 "description": (
-                    "Show a facial expression via head pose. "
-                    "Valid emotions: neutral, happy, sad, angry, surprised, love, tired, confused, excited. "
-                    "duration is optional and defaults to 2 seconds."
+                    "Show an animated emotion clip with head motion and sound. "
+                    "Valid names: amazed, angry, anxiety, attentive, boredom, calming, cheerful, come, "
+                    "confused, contempt, curious, dance, disgusted, displeased, downcast, dying, electric, "
+                    "enthusiastic, exhausted, fear, frustrated, furious, go_away, grateful, happy, helpful, "
+                    "impatient, indifferent, inquiring, irritated, laughing, lonely, lost, love, neutral, "
+                    "no, oops, proud, rage, relief, reprimand, resigned, sad, scared, serenity, shy, "
+                    "sleep, success, surprised, thoughtful, tired, uncertain, uncomfortable, understanding, "
+                    "welcoming, yes."
                 ),
                 "input": {
                     "emotion": "string",
-                    "duration": "number?",
                 },
             },
         ])
@@ -300,13 +297,13 @@ class UnifiedBridge:
     # --- Haseef tool handlers -----------------------------------------------
     async def _handle_show_expression(self, args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         name = args.get("emotion", "neutral")
-        duration = float(args.get("duration", 2.0))
-        valid = self.animation.list_expressions()
+        valid = self.robot.list_expressions()
         if name not in valid:
             return {"ok": False, "error": f"Unknown emotion '{name}'. Valid: {valid}"}
-        self.animation.show_expression(name, duration)
-        log.info("[Haseef tool] show_expression: %s (%.1fs)", name, duration)
-        return {"ok": True, "emotion": name, "duration": duration}
+        # play_move blocks; run in thread so Haseef gets the result promptly
+        await asyncio.to_thread(self.robot.show_expression, name)
+        log.info("[Haseef tool] show_expression: %s", name)
+        return {"ok": True, "emotion": name}
 
     async def _handle_move_head(
         self, args: Dict[str, Any], ctx: Dict[str, Any]
@@ -318,16 +315,11 @@ class UnifiedBridge:
         yaw = max(-60, min(60, yaw))
         pitch = max(-30, min(30, pitch))
 
-        # Smooth move in background thread (goto_target is blocking, ~0.3 s)
-        await asyncio.to_thread(self.head.move_smooth, yaw, pitch, 0.3)
-        await asyncio.sleep(0.5)  # brief settle after smooth animation
+        # goto_target is blocking; run in thread
+        await asyncio.to_thread(self.robot.move_head, yaw, pitch, 0.3)
+        await asyncio.sleep(0.5)
 
-        jpeg_b64 = None
-        if self.camera is not None:
-            jpeg_b64 = self.camera.get_base64_jpeg()
-        else:
-            log.warning("[Haseef tool] move_head: no camera for image")
-
+        jpeg_b64 = self.camera.get_base64_jpeg() if self.camera else None
         return {
             "ok": True,
             "yaw_deg": yaw,
@@ -347,10 +339,6 @@ class UnifiedBridge:
         if gemini is None:
             return {"ok": False, "error": "Gemini Live not connected"}
 
-        self.animation.set_tool_call(duration=0.5)
-
-        text = str(args.get("text", ""))
-        urgency = str(args.get("urgency", "normal")).lower()
         framed = (
             f"[Message from Haseef — your partner brain] {text}\n"
             "Speak this naturally as if it's your own thought. "
@@ -385,8 +373,6 @@ class UnifiedBridge:
     ) -> Dict[str, Any]:
         """Handle tool calls from Gemini Live. Must be async and return dict."""
         log.info("[Gemini tool] %s%s", name, args)
-
-        self.animation.set_tool_call(duration=0.8)
 
         if name == "queue_thinker_task":
             return await self._handle_queue_thinker_task(args)
@@ -508,15 +494,8 @@ async def main() -> None:
     else:
         log.warning("Direct camera failed; will use daemon camera instead.")
 
-    # --- Robot head ---------------------------------------------------------
-    head = RobotHead()
-    head.connect()
-    log.info("Robot head ready.")
-
-    # --- Animation controller -----------------------------------------------
-    animation = AnimationController(head)
-    animation.start()
-    log.info("Animation controller started.")
+    # --- Robot controller ---------------------------------------------------
+    robot = None
 
     # --- Haseef SDK ---------------------------------------------------------
     haseef_sdk = HsafaSDK(SdkOptions(
@@ -577,7 +556,7 @@ async def main() -> None:
 
     # --- Bridge -------------------------------------------------------------
     bridge = UnifiedBridge(
-        None, haseef_sdk, head, camera, animation, haseef_id,
+        None, haseef_sdk, robot, camera, haseef_id,
         main_loop=asyncio.get_running_loop(),
     )
     await bridge.setup_haseef()
@@ -610,6 +589,11 @@ async def main() -> None:
         media.start_recording()
         media.start_playing()
         log.info("Audio ready.")
+
+        # Create robot controller now that we have the ReachyMini instance
+        robot = RobotController(reachy)
+        bridge.robot = robot
+        log.info("Robot controller ready.")
 
         # If direct camera failed, wrap daemon's camera
         if camera is None:
@@ -671,7 +655,6 @@ async def main() -> None:
             return media.get_audio_sample()
 
         def speaker_sink(samples):
-            # animation.notify_audio(samples)  # TODO: debug why this breaks audio
             media.push_audio_sample(samples)
 
         # --- Gemini Live ----------------------------------------------------
@@ -725,8 +708,6 @@ async def main() -> None:
         _cap_running.clear()
         capture_thread.join(timeout=1.0)
     camera.close()
-    animation.stop()
-    head.disconnect()
     log.info("Shutdown complete.")
 
 

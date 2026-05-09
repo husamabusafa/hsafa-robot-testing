@@ -191,11 +191,12 @@ def _lerp(a: float, b: float, alpha: float) -> float:
 class EmotionClip:
     """A single parsed emotion clip ready for playback."""
 
-    def __init__(self, name: str, data: dict) -> None:
+    def __init__(self, name: str, data: dict, sound_path: Optional[Path] = None) -> None:
         self.name = name
         self.description = data.get("description", "")
         self.timestamps: List[float] = data["time"]
         self.trajectory: List[dict] = data["set_target_data"]
+        self.sound_path = sound_path
 
         # Pre-compute yaw/pitch/body_yaw for every keyframe
         self._poses: List[tuple[float, float, float, float, float]] = []  # yaw, pitch, body_yaw, ant_r, ant_l
@@ -272,7 +273,11 @@ class EmotionLibrary:
                     name = json_path.stem
                     with open(json_path, "r") as f:
                         data = json.load(f)
-                    self._clips[name] = EmotionClip(name, data)
+                    sound_path = json_path.with_suffix(".wav")
+                    self._clips[name] = EmotionClip(
+                        name, data,
+                        sound_path=sound_path if sound_path.exists() else None,
+                    )
 
                 log.info("Loaded %d emotion clips.", len(self._clips))
             except Exception as e:
@@ -332,26 +337,42 @@ class EmotionClipPlayer:
     def _playback_loop(self, clip: EmotionClip, duration: Optional[float]) -> None:
         t0 = time.time()
         play_duration = duration if duration is not None else clip.duration
-        last_yaw = 0.0
-        last_pitch = 0.0
-        last_body_yaw = 0.0
+        dt = 1 / 60.0  # ~60 Hz update for smooth motion
+
+        # Start sound in parallel if available
+        sound_thread = None
+        if clip.sound_path is not None and clip.sound_path.exists():
+            sound_thread = threading.Thread(
+                target=self._play_sound,
+                args=(clip.sound_path,),
+                daemon=True,
+                name=f"sound-{clip.name}",
+            )
+            sound_thread.start()
 
         while not self._stop.is_set():
             elapsed = time.time() - t0
             if elapsed >= play_duration:
                 break
 
-            yaw, pitch, body_yaw, _ant_r, _ant_l = clip.evaluate(elapsed)
-            # Only send if pose changed enough (like AnimationController)
-            if (
-                abs(yaw - last_yaw) > 1.0
-                or abs(pitch - last_pitch) > 1.0
-                or abs(body_yaw - last_body_yaw) > 1.0
-            ):
-                self.head.move_smooth(yaw, pitch, 0.15, body_yaw_deg=body_yaw)
-                last_yaw = yaw
-                last_pitch = pitch
-                last_body_yaw = body_yaw
-            time.sleep(0.05)  # ~20 Hz update
+            yaw, pitch, body_yaw, ant_r, ant_l = clip.evaluate(elapsed)
+            # Use set_pose (direct set_target) so the robot follows the clip
+            # trajectory exactly, without extra goto_target smoothing.
+            self.head.set_pose(yaw, pitch, body_yaw, ant_r, ant_l)
+            time.sleep(dt)
 
+        if sound_thread is not None:
+            sound_thread.join(timeout=0.5)
         log.info("Emotion clip '%s' finished.", clip.name)
+
+    def _play_sound(self, path: Path) -> None:
+        """Play a WAV file locally."""
+        try:
+            import subprocess
+            import platform
+            if platform.system() == "Darwin":
+                subprocess.run(["afplay", str(path)], check=False, timeout=30)
+            else:
+                subprocess.run(["aplay", str(path)], check=False, timeout=30)
+        except Exception as e:
+            log.warning("Failed to play sound %s: %s", path, e)
