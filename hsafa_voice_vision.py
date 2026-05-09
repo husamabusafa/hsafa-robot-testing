@@ -7,6 +7,7 @@ Exports:
 from __future__ import annotations
 
 import base64
+import collections
 import logging
 import math
 import threading
@@ -157,6 +158,12 @@ class RobotController:
         emphasis_yaw = 0.0
         emphasis_decay = 0.0
 
+        # Sound direction tracking
+        self._doa_history = collections.deque(maxlen=5)
+        self._doa_yaw_target = 0.0
+        self._doa_yaw_current = 0.0
+        self._last_doa_poll = 0.0
+
         while not self._stop_idle.is_set():
             state = self._anim_state
 
@@ -171,6 +178,32 @@ class RobotController:
                 state = "idle"
                 self._speech_amp = 0.0
                 emphasis_decay = 0.0
+
+            # Poll sound direction at ~10 Hz
+            now = time.time()
+            if now - self._last_doa_poll > 0.1:
+                self._last_doa_poll = now
+                try:
+                    doa, is_speech = self.reachy.media.get_DoA()
+                    if is_speech:
+                        self._doa_history.append(doa)
+                        n = len(self._doa_history)
+                        sin_mean = sum(math.sin(a) for a in self._doa_history) / n
+                        cos_mean = sum(math.cos(a) for a in self._doa_history) / n
+                        smoothed = math.atan2(sin_mean, cos_mean)
+                        # Deadzone around front/back ambiguity (π/2 ± 0.2 rad)
+                        if abs(smoothed - math.pi / 2) < 0.2:
+                            self._doa_yaw_target = 0.0
+                        else:
+                            self._doa_yaw_target = 60.0 - (smoothed / math.pi) * 120.0
+                    else:
+                        self._doa_history.clear()
+                        self._doa_yaw_target = 0.0
+                except Exception:
+                    pass
+
+            # Smooth toward target (or back to zero when speech stops)
+            self._doa_yaw_current += (self._doa_yaw_target - self._doa_yaw_current) * 0.15
 
             t = time.time() - t0
 
@@ -197,7 +230,7 @@ class RobotController:
                 pose = create_head_pose(
                     z=bob_z,
                     pitch=bob_pitch,
-                    yaw=drift_yaw + emphasis_yaw * emphasis_decay,
+                    yaw=drift_yaw + emphasis_yaw * emphasis_decay + self._doa_yaw_current,
                     roll=drift_roll,
                     degrees=True,
                     mm=True,
@@ -213,7 +246,7 @@ class RobotController:
                 pose = create_head_pose(
                     roll=roll,
                     pitch=pitch_off,
-                    yaw=yaw_off,
+                    yaw=yaw_off + self._doa_yaw_current,
                     degrees=True,
                     mm=True,
                 )

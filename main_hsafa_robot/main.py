@@ -226,6 +226,8 @@ class UnifiedBridge:
         self.camera = camera
         self.haseef_id = haseef_id
         self._main_loop = main_loop
+        self._say_lock = asyncio.Lock()
+        self._pending_says: list[str] = []
 
     # --- Haseef setup -------------------------------------------------------
     async def setup_haseef(self) -> None:
@@ -410,7 +412,14 @@ class UnifiedBridge:
             "Speak this naturally as if it's your own thought. "
             "Do not mention Haseef."
         )
-        self.gemini.inject_client_content(framed)
+
+        async with self._say_lock:
+            if gemini.is_speaking.is_set():
+                self._pending_says.append(framed)
+                log.info("[Haseef tool] say_this queued (Gemini speaking)")
+                return {"ok": True, "status": "queued", "text": text, "urgency": urgency}
+
+        gemini.inject_client_content(framed)
         return {"ok": True, "injected": text, "urgency": urgency}
 
     async def _handle_capture_image(
@@ -751,6 +760,19 @@ async def main() -> None:
         # --- Main loop ------------------------------------------------------
         stop_event = asyncio.Event()
 
+        async def _drain_say_queue():
+            while not stop_event.is_set():
+                await asyncio.sleep(0.15)
+                if gemini.is_speaking.is_set():
+                    continue
+                async with bridge._say_lock:
+                    if bridge._pending_says:
+                        text = bridge._pending_says.pop(0)
+                        gemini.inject_client_content(text)
+                        log.info("[SayDrain] injected queued text: %s", text[:80])
+
+        say_drain_task = asyncio.create_task(_drain_say_queue(), name="say-drain")
+
         def _sigint(*_):
             log.info("Caught SIGINT, shutting down...")
             stop_event.set()
@@ -766,6 +788,11 @@ async def main() -> None:
         # --- Shutdown -------------------------------------------------------
         log.info("Stopping Gemini Live...")
         gemini.stop()
+        say_drain_task.cancel()
+        try:
+            await say_drain_task
+        except asyncio.CancelledError:
+            pass
 
         log.info("Disconnecting Haseef...")
         await haseef_sdk.disconnect()
